@@ -1,0 +1,338 @@
+---
+title: "The WebSocket Handshake"
+description: "Upgrade an HTTP connection to WebSocket by validating the request headers and computing the Sec-WebSocket-Accept key"
+postNumber: 17
+publishDate: 2026-09-19T00:00:00Z
+tags: ["intermediate", "networking", "websocket"]
+difficulty: "intermediate"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+The HTTP server from lesson 16 answers one request and closes the connection. That model is wrong for chat. When Alice sends a message, the server has to push it to Bob right away, and HTTP only lets a server speak when it is asked. WebSocket (RFC 6455) solves this. A connection starts as a normal HTTP request, both sides agree to switch protocols, and from then on the same TCP socket carries messages in both directions for as long as it stays open.
+
+## The Upgrade Request
+
+When JavaScript runs `new WebSocket("ws://localhost:8080/ws")`, the browser opens a TCP connection and sends a `GET` request with some extra headers.
+
+```text
+GET /ws HTTP/1.1
+Host: localhost:8080
+Connection: Upgrade
+Upgrade: websocket
+Origin: http://localhost:8080
+Sec-WebSocket-Version: 13
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+```
+
+`Upgrade: websocket` names the protocol the client wants. `Connection: Upgrade` tells the server that the `Upgrade` header applies to this connection. `Sec-WebSocket-Version` is always 13. `Sec-WebSocket-Key` is 16 random bytes in base64, new for every connection.
+
+Starting with HTTP has practical benefits. WebSocket traffic uses the same port as the web page, passes through the same proxies, and carries cookies and an `Origin` header that the server can check.
+
+The server agrees with status `101 Switching Protocols`.
+
+```text
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+After the empty line that ends this response, the connection is no longer HTTP.
+
+## Computing the Accept Key
+
+The server has to prove that it understood the WebSocket request. A cache or an old HTTP server that replays a stored response cannot produce the right `Sec-WebSocket-Accept` value, so the browser can tell the difference. The recipe is fixed by the RFC.
+
+1. Append the GUID `258EAFA5-E914-47DA-95CA-C5AB0DC85B11` to the key the client sent
+2. Hash the result with SHA-1
+3. Encode the 20-byte digest with base64
+
+This is not encryption and keeps nothing secret. It is only a check that both sides speak WebSocket. The RFC includes a sample key, so we can verify each step in `rebar3 shell`.
+
+```erlang
+1> Key = <<"dGhlIHNhbXBsZSBub25jZQ==">>.
+<<"dGhlIHNhbXBsZSBub25jZQ==">>
+2> Guid = <<"258EAFA5-E914-47DA-95CA-C5AB0DC85B11">>.
+<<"258EAFA5-E914-47DA-95CA-C5AB0DC85B11">>
+3> Digest = crypto:hash(sha, <<Key/binary, Guid/binary>>).
+<<179,122,79,44,192,98,79,22,144,246,70,6,207,56,89,69,
+  178,190,196,234>>
+4> byte_size(Digest).
+20
+5> base64:encode(Digest).
+<<"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=">>
+```
+
+That is the value from the RFC. Note that the key is used as the text the client sent. We never decode it.
+
+`crypto` is a separate OTP application, so our application should declare that it depends on it. Releases in lesson 25 rely on this list.
+
+**Update `src/chat_server.app.src`:**
+
+```erlang
+  {applications, [kernel, stdlib, crypto]},
+```
+
+## The chat_ws Module
+
+`chat_ws` holds everything specific to WebSocket. Like `chat_http`, it contains only pure functions. They work on the request map that `chat_http:parse_request/1` returns, where header names are lowercase binaries.
+
+**Create `src/chat_ws.erl`:**
+
+```erlang
+-module(chat_ws).
+-export([is_upgrade/1, accept_key/1, handshake_response/1]).
+
+-define(GUID, <<"258EAFA5-E914-47DA-95CA-C5AB0DC85B11">>).
+
+is_upgrade(#{method := 'GET', headers := Headers}) ->
+    Upgrade = string:lowercase(maps:get(<<"upgrade">>, Headers, <<>>)),
+    Connection = string:lowercase(maps:get(<<"connection">>, Headers, <<>>)),
+    Tokens = [string:trim(T) || T <- binary:split(Connection, <<",">>, [global])],
+    Upgrade =:= <<"websocket">>
+        andalso lists:member(<<"upgrade">>, Tokens)
+        andalso maps:is_key(<<"sec-websocket-key">>, Headers);
+is_upgrade(_Request) ->
+    false.
+
+accept_key(Key) ->
+    base64:encode(crypto:hash(sha, <<Key/binary, ?GUID/binary>>)).
+
+handshake_response(#{headers := Headers} = Request) ->
+    case is_upgrade(Request) of
+        true ->
+            Key = maps:get(<<"sec-websocket-key">>, Headers),
+            {ok, chat_http:response(101, [
+                {<<"Upgrade">>, <<"websocket">>},
+                {<<"Connection">>, <<"Upgrade">>},
+                {<<"Sec-WebSocket-Accept">>, accept_key(Key)}
+            ], <<>>)};
+        false ->
+            {error, not_websocket}
+    end;
+handshake_response(_Request) ->
+    {error, not_websocket}.
+```
+
+`is_upgrade/1` has to be tolerant, because header values are case-insensitive here and clients differ. Some send `Upgrade: WebSocket`. Firefox sends `Connection: keep-alive, Upgrade`, a comma-separated list. So we lowercase both values, split the `Connection` header into tokens, trim the spaces, and look for `upgrade` among them. A plain comparison with `<<"Upgrade">>` would lock Firefox out.
+
+`handshake_response/1` reuses `chat_http:response/3`. A 101 response has no body, which is why `response/3` leaves out `Content-Length` for status codes below 200.
+
+```erlang
+6> r3:compile().
+ok
+7> chat_ws:accept_key(Key).
+<<"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=">>
+8> Request = #{method => 'GET', path => <<"/ws">>, headers => #{
+8>     <<"upgrade">> => <<"websocket">>,
+8>     <<"connection">> => <<"keep-alive, Upgrade">>,
+8>     <<"sec-websocket-key">> => Key}}.
+#{path => <<"/ws">>,
+  headers =>
+      #{<<"connection">> => <<"keep-alive, Upgrade">>,
+        <<"sec-websocket-key">> => <<"dGhlIHNhbXBsZSBub25jZQ==">>,
+        <<"upgrade">> => <<"websocket">>},
+  method => 'GET'}
+9> chat_ws:is_upgrade(Request).
+true
+10> chat_ws:is_upgrade(Request#{headers := #{}}).
+false
+11> {ok, Response} = chat_ws:handshake_response(Request), io:format("~s", [Response]).
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+
+ok
+12> chat_ws:handshake_response(Request#{headers := #{}}).
+{error,not_websocket}
+```
+
+## Upgrading in the Demo Server
+
+`http_server` needs a route for `/ws`. Unlike the other routes, it must not close the socket after responding. Replace the `{ok, Request, _Rest}` clause in `read_request/2` and add `route/3` and `ws_loop/1`. The rest of the module stays as it was.
+
+**Update `src/http_server.erl`:**
+
+```erlang
+%% In src/http_server.erl
+
+%% in read_request/2, the first case clause becomes
+        {ok, Request, Rest} ->
+            route(Socket, Request, Rest);
+
+route(Socket, #{path := <<"/ws">>} = Request, _Rest) ->
+    case chat_ws:handshake_response(Request) of
+        {ok, Response} ->
+            gen_tcp:send(Socket, Response),
+            io:format("~p: WebSocket open~n", [self()]),
+            ws_loop(Socket);
+        {error, not_websocket} ->
+            gen_tcp:send(Socket, text_response(400, <<"WebSocket upgrade expected\n">>)),
+            gen_tcp:close(Socket)
+    end;
+route(Socket, Request, _Rest) ->
+    gen_tcp:send(Socket, handle(Request)),
+    gen_tcp:close(Socket).
+
+%% The connection is no longer HTTP. Print whatever bytes arrive.
+ws_loop(Socket) ->
+    case gen_tcp:recv(Socket, 0) of
+        {ok, Data} ->
+            io:format("~p: received ~p~n", [self(), Data]),
+            ws_loop(Socket);
+        {error, Reason} ->
+            io:format("~p: WebSocket closed (~p)~n", [self(), Reason]),
+            gen_tcp:close(Socket)
+    end.
+```
+
+Compile, run `http_server:start().` and try the handshake with `curl`. We have to supply the headers a browser would send. `-N` turns off buffering.
+
+```bash
+$ curl -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" \
+    -H "Sec-WebSocket-Version: 13" \
+    -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+    http://localhost:8080/ws
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+
+```
+
+`curl` now hangs, because the connection stays open. Stop it with Ctrl+C. A plain request to the same path is refused.
+
+```bash
+$ curl -i http://localhost:8080/ws
+HTTP/1.1 400 Bad Request
+Content-Length: 27
+Content-Type: text/plain
+Connection: close
+
+WebSocket upgrade expected
+```
+
+Now the real test. Open `http://localhost:8080/` in a browser, open the developer console on that page, and connect.
+
+```javascript
+const ws = new WebSocket("ws://localhost:8080/ws");
+ws.onopen = () => console.log("connected");
+ws.onclose = () => console.log("closed");
+// connected
+ws.send("hi");
+```
+
+The browser logs `connected` only if our `Sec-WebSocket-Accept` value is correct. With a wrong value it reports a failed connection instead. After `ws.send("hi")` the Erlang shell shows what arrived.
+
+```text
+<0.172.0>: WebSocket open
+<0.172.0>: received <<129,130,101,218,35,6,13,179>>
+```
+
+Eight bytes for a two-letter message, and none of them is `h` or `i`. The message is wrapped in a WebSocket frame and masked with a random key, so your bytes will differ. Lesson 18 decodes it.
+
+## Exercises
+
+**Exercise 1: Check the version**
+
+The RFC says a server should reject versions other than 13 with status 426 and a `Sec-WebSocket-Version: 13` header. Add that check to the `/ws` route.
+
+```bash
+curl -i -H "Connection: Upgrade" -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 8" -H "Sec-WebSocket-Key: abc" http://localhost:8080/ws
+# Expected: HTTP/1.1 426 Upgrade Required
+```
+
+**Exercise 2: A handshake client**
+
+Write the client side with `gen_tcp`. Generate a key with `base64:encode(crypto:strong_rand_bytes(16))`, send the upgrade request, parse the response, and compare the accept header with `chat_ws:accept_key/1`.
+
+```erlang
+% ws_client:connect("localhost", 8080, <<"/ws">>).
+% Expected: {ok, Socket}
+% or {error, bad_accept_key} when the values differ
+```
+
+**Exercise 3: Check the origin**
+
+Browsers send an `Origin` header, and a server can refuse pages from other sites. Write `chat_ws:origin_allowed/2`.
+
+```erlang
+% chat_ws:origin_allowed(Request, [<<"http://localhost:8080">>]).
+% Expected: true when the origin header is in the list, false otherwise
+```
+
+## Key Takeaways
+
+- **WebSocket starts as HTTP**. A `GET` with `Upgrade: websocket` and `Connection: Upgrade` asks to switch protocols on the same TCP connection
+- **Server push** is the reason. After the upgrade both sides can send at any time, which request/response HTTP cannot do
+- **`Sec-WebSocket-Accept`** is base64 of the SHA-1 of the client key plus a fixed GUID. It proves the server understood the request and is not a security feature
+- **`101 Switching Protocols`** has no body and no `Content-Length`. Everything after its empty line is WebSocket data
+- **Compare header values case-insensitively** and treat `Connection` as a comma-separated list, or some browsers cannot connect
+- **Keep the socket open** after the handshake. The handler process now owns a long-lived connection
+- **Test against known values**. The RFC sample key `dGhlIHNhbXBsZSBub25jZQ==` must give `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l17_switching_status",
+      question: "Which status code tells the client that the server agrees to switch protocols?",
+      code: 'upgrade_response(AcceptKey) ->\n    chat_http:response(___, [\n        {<<"Upgrade">>, <<"websocket">>},\n        {<<"Connection">>, <<"Upgrade">>},\n        {<<"Sec-WebSocket-Accept">>, AcceptKey}\n    ], <<>>).',
+      answer: "101",
+      hint: "Its reason phrase is Switching Protocols.",
+      explanation: "A successful WebSocket handshake is answered with 101 Switching Protocols."
+    },
+    {
+      id: "l17_hash_algorithm",
+      question: "Which hash algorithm does the WebSocket handshake use?",
+      code: 'Key = <<"dGhlIHNhbXBsZSBub25jZQ==">>.\nGuid = <<"258EAFA5-E914-47DA-95CA-C5AB0DC85B11">>.\nbase64:encode(crypto:hash(___, <<Key/binary, Guid/binary>>)).\n% => <<"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=">>',
+      answer: "sha",
+      hint: "SHA-1. The crypto module has a short atom for it.",
+      explanation: "crypto:hash(sha, Data) computes SHA-1. Base64 of that digest is the Sec-WebSocket-Accept value."
+    },
+    {
+      id: "l17_digest_size",
+      question: "How many bytes does a SHA-1 digest have?",
+      code: 'byte_size(crypto:hash(sha, <<"any input at all">>)).\n% => ___',
+      answer: "20",
+      hint: "SHA-1 produces 160 bits.",
+      explanation: "SHA-1 always returns 160 bits, which is 20 bytes, whatever the input size."
+    },
+    {
+      id: "l17_client_key_size",
+      question: "How many random bytes are inside a Sec-WebSocket-Key?",
+      code: 'byte_size(base64:decode(<<"dGhlIHNhbXBsZSBub25jZQ==">>)).\n% => ___',
+      answer: "16",
+      hint: "The RFC sample decodes to the text: the sample nonce.",
+      explanation: "The client key is 16 random bytes in base64. The server never decodes it and uses the text as it is."
+    },
+    {
+      id: "l17_connection_tokens",
+      question: "What is the second token after lowercasing and trimming Firefox's Connection header?",
+      code: 'Connection = string:lowercase(<<"keep-alive, Upgrade">>).\n[string:trim(T) || T <- binary:split(Connection, <<",">>, [global])].\n% => [<<"keep-alive">>, ___]',
+      answer: '<<"upgrade">>',
+      hint: "Lowercased, and without the space after the comma.",
+      explanation: "The header is a comma-separated list. Lowercasing and trimming each token makes lists:member/2 find upgrade."
+    },
+    {
+      id: "l17_missing_header",
+      question: "What does this check return for a request without an Upgrade header?",
+      code: 'wants_websocket(Headers) ->\n    Upgrade = maps:get(<<"upgrade">>, Headers, <<>>),\n    string:lowercase(Upgrade) =:= <<"websocket">>.\n\nwants_websocket(#{<<"host">> => <<"localhost:8080">>}).\n% => ___',
+      answer: "false",
+      hint: "maps:get/3 returns the default, an empty binary.",
+      explanation: "The default <<>> is not equal to <<\"websocket\">>, so ordinary HTTP requests are not treated as upgrades."
+    },
+    {
+      id: "l17_not_websocket",
+      question: "Which error reason does handshake_response return for an ordinary HTTP request?",
+      code: 'route(Socket, Request) ->\n    case chat_ws:handshake_response(Request) of\n        {ok, Response} ->\n            gen_tcp:send(Socket, Response);\n        {error, ___} ->\n            gen_tcp:send(Socket, chat_http:response(400, [], <<"upgrade expected">>)),\n            gen_tcp:close(Socket)\n    end.',
+      answer: "not_websocket",
+      hint: "The request is valid HTTP. It is just not a WebSocket upgrade.",
+      explanation: "handshake_response/1 returns {error, not_websocket} when is_upgrade/1 is false, and the server answers 400."
+    }
+  ]}
+/>

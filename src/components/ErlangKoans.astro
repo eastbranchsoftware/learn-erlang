@@ -12,6 +12,14 @@ export interface Props {
 }
 
 const { koans } = Astro.props;
+
+// Koan code is full of Erlang binaries like <<"hi">>, so escape it before
+// it goes through set:html. Only the blank marker becomes real markup.
+const escapeHtml = (text: string) =>
+  text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+const renderLine = (line: string) =>
+  escapeHtml(line).replace(/___/g, '<span class="koan-blank">___</span>');
 ---
 
 <div class="koans-section mt-8 p-6 bg-gradient-to-r from-yellow-50 to-orange-50 dark:from-yellow-900/20 dark:to-orange-900/20 rounded-lg border border-yellow-200 dark:border-yellow-800">
@@ -52,7 +60,7 @@ const { koans } = Astro.props;
                           <span class="text-blue-400 select-none" style="min-width: 24px;">
                             {index === 0 ? '1>' : '1>'}
                           </span>
-                          <span class="text-white whitespace-pre-wrap flex-1" set:html={line.replace(/___/g, '<span class="koan-blank">___</span>')} />
+                          <span class="text-white whitespace-pre-wrap flex-1" set:html={renderLine(line)} />
                         </div>
                       ))}
                     </div>

@@ -1,0 +1,321 @@
+---
+title: "Hot Code Reloading"
+description: "Load new code into a running chat server without dropping connections, and migrate gen_server state with code_change"
+postNumber: 33
+publishDate: 2026-09-19T00:00:00Z
+tags: ["advanced", "hot-code-loading", "otp"]
+difficulty: "advanced"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+Lesson 32 dealt with nodes that fail on their own. A deploy is a failure we cause ourselves. Restarting a chat node closes every WebSocket on it. The Erlang VM can replace the code of a module while processes keep running, so a bug fix need not cost a single connection.
+
+## Two Versions of a Module
+
+The VM keeps up to two versions of each module, called current and old. Loading a module makes the new code current and turns the previous code into old. Processes running the old code keep running it.
+
+What moves a process to the new code is the form of the call. A local call such as `loop(State)` stays inside the version the process is already running. A fully qualified call such as `greeter:loop(State)` always enters the current version.
+
+A loop in the style of lesson 09 shows it. Use a scratch directory and plain `erl`.
+
+**Create `greeter.erl`:**
+
+```erlang
+-module(greeter).
+-export([start/1, ask/1, sticky/1, fresh/1]).
+-vsn(1).
+
+start(Loop) ->
+    spawn(?MODULE, Loop, [0]).
+
+ask(Pid) ->
+    Pid ! {self(), greet},
+    receive {Pid, Reply} -> Reply after 1000 -> timeout end.
+
+greeting() -> <<"Welcome!">>.
+
+%% Local call.
+sticky(Count) ->
+    receive
+        {From, greet} ->
+            From ! {self(), {greeting(), Count + 1}},
+            sticky(Count + 1)
+    end.
+
+%% Fully qualified call.
+fresh(Count) ->
+    receive
+        {From, greet} ->
+            From ! {self(), {greeting(), Count + 1}},
+            ?MODULE:fresh(Count + 1)
+    end.
+```
+
+A qualified call only works on exported functions, which is why `sticky/1` and `fresh/1` are exported. Start one process of each kind.
+
+```erlang
+1> c(greeter).
+{ok,greeter}
+2> S = greeter:start(sticky).
+<0.91.0>
+3> F = greeter:start(fresh).
+<0.93.0>
+4> greeter:ask(S).
+{<<"Welcome!">>,1}
+5> greeter:ask(F).
+{<<"Welcome!">>,1}
+```
+
+Leave the shell open. Edit the file so `greeting()` returns `<<"Welcome to the chat!">>` and the attribute says `-vsn(2).`, then compile again.
+
+```erlang
+6> c(greeter).
+{ok,greeter}
+7> greeter:ask(S).
+{<<"Welcome!">>,2}
+8> greeter:ask(F).
+{<<"Welcome!">>,2}
+9> greeter:ask(F).
+{<<"Welcome to the chat!">>,3}
+10> greeter:ask(S).
+{<<"Welcome!">>,3}
+```
+
+Both processes kept their counters. `S` still runs version 1 and always will. `F` answered once more from version 1 on line 8, because it was waiting in a `receive` inside the old code. Its qualified call then moved it to version 2.
+
+`erlang:check_process_code(S, greeter)` now returns `true`, because `S` still runs old code.
+
+Purging removes the old version. `code:soft_purge/1` refuses when a process still needs it. `code:purge/1` kills those processes. There is no room for a third version, so `c/1` purges before it loads. Change the greeting to `<<"Welcome back!">>`, set `-vsn(3).` and watch `S`.
+
+```erlang
+11> monitor(process, S).
+#Ref<0.2096369211.4158128132.159396>
+12> c(greeter).
+{ok,greeter}
+13> flush().
+Shell got {'DOWN',#Ref<0.2096369211.4158128132.159396>,process,<0.91.0>,
+                  killed}
+ok
+14> greeter:ask(F).
+{<<"Welcome to the chat!">>,4}
+15> greeter:ask(F).
+{<<"Welcome back!">>,5}
+```
+
+Version 1 had to go, and `S` went with it. `F` was in version 2. Every long-lived loop needs a qualified call on its path, or the second upgrade kills it. That includes loops that block, like the acceptor in `chat_listener`.
+
+## Loading and Inspecting Code
+
+`c(Mod)` compiles the source, purges old code and loads the new `.beam`. `l(Mod)` does the same without compiling. It loads the `.beam` found on the code path. `code:load_file(Mod)` never purges. If an old version still exists it returns `{error,not_purged}`. Combine it with `code:soft_purge/1` when no process may be killed.
+
+To see what is loaded, ask the module. `greeter:module_info(attributes)` returns `[{vsn,[3]}]` now. A module without a `-vsn` attribute gets a number derived from its MD5 checksum. `code:which(greeter)` returns the path of the loaded `.beam` file.
+
+## gen_server Processes
+
+A gen_server process loops inside the `gen_server` module, which we never reload. It calls our callbacks as `Mod:handle_call(...)`, fully qualified, for every message. New callback code takes effect with the next message. Most of the chat server is gen_servers, so most fixes are one `l(chat_room).` away.
+
+The hard part is the state. New code receives the state that old code built. We'll change `chat_stats` from lesson 12 so it remembers when it started. The state becomes a record.
+
+**Update `src/chat_stats.erl`.** Export `code_change/3` and change these parts.
+
+```erlang
+%% In src/chat_stats.erl
+-vsn(2).
+
+-record(state, {counters = #{}, started_at}).
+
+init([]) ->
+    {ok, #state{started_at = erlang:system_time(second)}}.
+
+handle_call({get, Counter}, _From, State = #state{counters = Counters}) ->
+    {reply, maps:get(Counter, Counters, 0), State};
+handle_call(get_all, _From, State = #state{counters = Counters}) ->
+    {reply, Counters, State};
+handle_call(reset, _From, State) ->
+    {reply, ok, State#state{counters = #{}}}.
+
+handle_cast({increment, Counter}, State = #state{counters = Counters}) ->
+    Count = maps:get(Counter, Counters, 0),
+    {noreply, State#state{counters = Counters#{Counter => Count + 1}}}.
+
+%% Downgrade. Back to the plain map of version 1.
+code_change({down, _Vsn}, #state{counters = Counters}, _Extra) ->
+    {ok, Counters};
+%% Upgrade. The version 1 state was the counters map itself.
+code_change(_OldVsn, Counters, _Extra) when is_map(Counters) ->
+    {ok, #state{counters = Counters,
+                started_at = erlang:system_time(second)}}.
+```
+
+First the wrong way. Start `erl` in `src` with the lesson 12 version compiled, add a few counts, then save the new source and load it. The report is shortened.
+
+```erlang
+1> gen_server:start({local, chat_stats}, chat_stats, [], []).
+{ok,<0.91.0>}
+2> chat_stats:increment(messages).
+ok
+3> chat_stats:increment(messages).
+ok
+4> c(chat_stats).
+{ok,chat_stats}
+5> chat_stats:get(messages).
+** Generic server chat_stats terminating
+** When Server state == #{messages => 2}
+** {function_clause,[{chat_stats,handle_call,
+                                 [{get,messages}, ..., #{messages => 2}],
+                                 [{file,"chat_stats.erl"},{line,32}]}, ...]}
+```
+
+The new `handle_call/3` expects a `#state` record and got a map. The supervisor would restart it with empty counters. For `chat_room` the same mistake loses the history of a live room.
+
+## Migrating State with code_change
+
+`code_change(OldVsn, State, Extra)` converts the state. It must return `{ok, NewState}`. gen_server runs it only on request and only while the process is suspended, so no message reaches new callbacks with old state. Go back to the lesson 12 source, restart `erl`, repeat lines 1 to 3, and save the new source again. This time suspend first.
+
+```erlang
+4> sys:suspend(chat_stats).
+ok
+5> c(chat_stats).
+{ok,chat_stats}
+6> sys:change_code(chat_stats, chat_stats, 1, []).
+ok
+7> sys:resume(chat_stats).
+ok
+8> sys:get_state(chat_stats).
+{state,#{messages => 2},1789828231}
+9> chat_stats:increment(messages).
+ok
+10> chat_stats:get(messages).
+3
+```
+
+The counters survived, and so did the pid and the registered name. Calls made during the suspension wait in the mailbox.
+
+The last two arguments of `sys:change_code/4` are `OldVsn` and `Extra`. By hand any value works, and we passed `1`. A release upgrade passes the `-vsn` of the module being replaced, which is the MD5 number for our lesson 12 file. So the upgrade clause matches on the shape of the state.
+
+For a downgrade, `OldVsn` is `{down, Vsn}` and the order flips. Only the newer module knows both shapes, so call `sys:change_code(chat_stats, chat_stats, {down, 1}, [])` while version 2 is still loaded, then load version 1, then resume.
+
+## Upgrading a Release
+
+OTP can script these steps for a whole release. An application ships an `.appup` file with instructions for moving between two versions. For rebar3, write it as `src/chat_server.appup.src`.
+
+```erlang
+{"0.2.0",
+ [{"0.1.0", [{update, chat_stats, {advanced, []}},
+             {load_module, chat_ws}]}],
+ [{"0.1.0", [{update, chat_stats, {advanced, []}},
+             {load_module, chat_ws}]}]}.
+```
+
+The first list upgrades from "0.1.0", the second downgrades to it. `load_module` is for modules without process state, like `chat_ws`. `update` with `advanced` suspends every process that uses the module, loads it, calls `code_change/3` with `[]` as `Extra`, and resumes. `rebar3 relup` combines the appups of all applications into a `relup` file. On the running node, `release_handler:install_release/1` executes it. We do not run a relup in this tutorial. The manual steps above are what it does for each process.
+
+Most teams do not ship relups. They run several nodes behind a load balancer, as in lesson 31, and restart them one at a time. A rolling restart uses the same startup path every time. Every relup is a one-off program that needs its own test. Hot loading fits a small fix when thousands of long-lived connections make a restart expensive. It also fits debugging. In `bin/chat_server remote_console` you can load a module with extra logging, then load the original back.
+
+## Pitfalls
+
+**Funs remember their version.** A fun created by `fun() -> ... end` belongs to the module version that created it. Once that version is purged, calling it fails with `badfun`. Keep such funs out of long-lived state. `fun Mod:Name/Arity` is safe because it is resolved at call time.
+
+**Records are compiled in.** A `#state` record is a tuple whose layout is fixed at compile time. Adding a field changes the tuple size, so every such change needs a `code_change/3` clause. Records stored in ETS or Mnesia get no callback. Convert them yourself.
+
+**One load per node.** Code is loaded per VM. In a cluster, `nl(Mod)` loads the module on every connected node.
+
+## Exercises
+
+**Exercise 1: Upgrade on Request**
+
+Add a third loop `on_demand/1` to `greeter`. It makes local calls, except when it receives the message `upgrade`.
+
+```erlang
+% Expected after editing greeting() and c(greeter):
+% greeter:ask(P).   => old greeting
+% P ! upgrade.
+% greeter:ask(P).   => new greeting, counter intact
+```
+
+**Exercise 2: Safe Load**
+
+Write `safe_load(Mod)` in a module `upgrade`. It must never kill a process.
+
+```erlang
+% Use code:soft_purge/1 and code:load_file/1.
+% Expected:
+% upgrade:safe_load(greeter).  => {module,greeter}
+% With a sticky process in old code:
+% upgrade:safe_load(greeter).  => {error,old_code_in_use}
+```
+
+**Exercise 3: Last Updated**
+
+Make a version 3 of `chat_stats` whose counters map holds `{Count, LastUpdated}` tuples instead of integers. Add a `code_change/3` clause that converts a version 2 record. Use `maps:map/2`.
+
+```erlang
+% Expected after upgrading a server with #{messages => 3}:
+% sys:get_state(chat_stats).
+% => {state,#{messages => {3,1789828500}},1789828231}
+```
+
+## Key Takeaways
+
+- **Two versions** of a module can exist, current and old. Loading a third purges the old one and kills processes still running it
+- **Fully qualified calls** such as `?MODULE:loop(State)` enter the current version. Local calls stay in the version they are in
+- **gen_server callbacks** are called fully qualified, so new code runs on the next message
+- **`code_change/3`** converts old state to new state and returns `{ok, NewState}`. `{down, Vsn}` marks a downgrade
+- **`sys:suspend/1`, load, `sys:change_code/4`, `sys:resume/1`** is the manual upgrade. An `.appup` file scripts the same steps for a release
+- **Rolling restarts** are the usual way to deploy. Hot loading fits urgent fixes and debugging
+- **Anonymous funs and records** tie data to one version of the code
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l33_qualified_loop_call",
+      question: "What goes before the colon so every iteration enters the current version of the module?",
+      code: "loop(Count) ->\n    receive\n        {From, greet} ->\n            From ! {self(), Count + 1},\n            ___:loop(Count + 1)\n    end.",
+      answer: "?MODULE",
+      hint: "The macro for the current module name.",
+      explanation: "A fully qualified call always runs the current version. A local call stays in the old code."
+    },
+    {
+      id: "l33_code_change_counters",
+      question: "What does the last expression return after the old state is converted?",
+      code: "code_change(_OldVsn, Counters, _Extra) when is_map(Counters) ->\n    {ok, #{counters => Counters, started_at => 0}}.\n\n{ok, New} = code_change(1, #{messages => 3}, []).\nmaps:get(messages, maps:get(counters, New)).\n% => ___",
+      answer: "3",
+      hint: "The old map becomes the value under the counters key.",
+      explanation: "code_change/3 wraps the old counters map in the new state, so no count is lost."
+    },
+    {
+      id: "l33_versioned_state",
+      question: "Which version tag does the state carry after two upgrade calls?",
+      code: "upgrade({v1, Counters}) -> {v2, Counters, 0};\nupgrade({v2, _Counters, _Started} = State) -> State.\n\nelement(1, upgrade(upgrade({v1, #{}}))).\n% => ___",
+      answer: "v2",
+      hint: "The second clause leaves a v2 state alone.",
+      explanation: "A version tag makes the conversion safe to run twice. Upgraded state passes through unchanged."
+    },
+    {
+      id: "l33_down_tag",
+      question: "Which atom tags OldVsn when code_change/3 is called for a downgrade?",
+      code: "code_change({down, _Vsn}, {state, Counters, _Started}, _Extra) ->\n    {ok, Counters};\ncode_change(_OldVsn, Counters, _Extra) ->\n    {ok, {state, Counters, 0}}.\n\ncode_change({___, 1}, {state, #{joins => 2}, 99}, []).\n% => {ok, #{joins => 2}}",
+      answer: "down",
+      hint: "The first clause returns the plain map.",
+      explanation: "For a downgrade OldVsn is a tuple tagged down. The newer module converts its state back to the old shape."
+    },
+    {
+      id: "l33_appup_advanced",
+      question: "Which atom makes the release handler call code_change/3?",
+      code: "{update, chat_stats, {___, []}}.",
+      answer: "advanced",
+      hint: "The list next to it becomes the Extra argument.",
+      explanation: "With advanced, the processes are suspended, the module is loaded, code_change/3 runs and the processes resume."
+    },
+    {
+      id: "l33_sys_resume",
+      question: "Which sys function lets the server handle messages again?",
+      code: "init([]) ->\n    {ok, 5}.\n\nhandle_call(get, _From, State) ->\n    {reply, State, State}.\n\ncode_change(_OldVsn, Count, _Extra) ->\n    {ok, #{count => Count}}.\n\n{ok, Pid} = gen_server:start_link(?MODULE, [], []).\nsys:suspend(Pid).\nsys:change_code(Pid, ?MODULE, 1, []).\nsys:___(Pid).\ngen_server:call(Pid, get).\n% => #{count => 5}",
+      answer: "resume",
+      hint: "It is the opposite of suspend.",
+      explanation: "A suspended process only handles system messages. After sys:resume/1 it answers with the converted state."
+    }
+  ]}
+/>

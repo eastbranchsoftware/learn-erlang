@@ -1,0 +1,368 @@
+---
+title: "Node Discovery and Clustering"
+description: "Build a process that connects chat server nodes on startup and reconnects them after failures"
+postNumber: 30
+publishDate: 2026-09-19T00:00:00Z
+tags: ["advanced", "distributed", "clustering"]
+difficulty: "advanced"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+In lesson 29 we connected nodes by typing `net_adm:ping/1` into a shell. A production server has nobody at the shell. A node that boots at 3am must find its peers on its own, and when a peer restarts the two must reconnect without help. We'll give the chat server a small process that does both.
+
+## What the Cluster Process Does
+
+Erlang connects nodes on first contact, but something has to make that first contact. The VM also never retries. When a connection drops, it stays down until some process talks to the other node again. So the job has three parts.
+
+1. Know which nodes should be in the cluster.
+2. Connect to them at startup, and keep trying the ones that are missing.
+3. Notice when nodes come and go, and log it.
+
+Two kernel functions do the real work. `net_kernel:connect_node/1` connects to a node and returns `true` or `false`. It is what `net_adm:ping/1` calls underneath. On a VM started without a node name it returns `ignored`, so our code stays harmless in a plain `rebar3 shell`. `net_kernel:monitor_nodes(true)` subscribes the calling process to `{nodeup, Node}` and `{nodedown, Node}` messages for every connection that opens or closes.
+
+## The chat_cluster Module
+
+The list of nodes comes from the application environment, like the port in lesson 25.
+
+**Create `src/chat_cluster.erl`:**
+
+```erlang
+-module(chat_cluster).
+-behaviour(gen_server).
+
+-export([start_link/0, connected/0, expected/0]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+
+-define(RETRY_MS, 5000).
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+%% Expected nodes we are connected to right now.
+connected() ->
+    gen_server:call(?MODULE, connected).
+
+%% Every node this node should be connected to.
+expected() ->
+    gen_server:call(?MODULE, expected).
+
+init([]) ->
+    Nodes = application:get_env(chat_server, cluster_nodes, []),
+    Expected = lists:usort(Nodes) -- [node()],
+    ok = net_kernel:monitor_nodes(true),
+    self() ! connect,
+    {ok, #{expected => Expected}}.
+
+handle_call(connected, _From, State = #{expected := Expected}) ->
+    {reply, [N || N <- Expected, lists:member(N, nodes())], State};
+handle_call(expected, _From, State = #{expected := Expected}) ->
+    {reply, Expected, State}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info(connect, State = #{expected := Expected}) ->
+    Missing = Expected -- nodes(),
+    [net_kernel:connect_node(N) || N <- Missing],
+    erlang:send_after(?RETRY_MS, self(), connect),
+    {noreply, State};
+handle_info({nodeup, Node}, State) ->
+    logger:notice("cluster: ~s is up, connected to ~p", [Node, nodes()]),
+    {noreply, State};
+handle_info({nodedown, Node}, State) ->
+    logger:warning("cluster: ~s is down, connected to ~p", [Node, nodes()]),
+    {noreply, State};
+handle_info(_Other, State) ->
+    {noreply, State}.
+```
+
+**The same list on every node.** `init/1` removes `node()` from the configured list. Every node can then ship the identical config file, and nobody tries to connect to itself.
+
+**`init/1` does not connect.** It sends itself a `connect` message and returns. A supervisor waits for `init/1` before it starts the next child, and `connect_node/1` can block for seconds when a host does not answer. Doing the work in `handle_info/2` keeps startup fast.
+
+**One handler, two jobs.** The `connect` clause computes `Expected -- nodes()`, tries each missing node, and schedules itself again with `erlang:send_after/3`. The first run is the startup connect. Every later run is the retry.
+
+**Node events arrive as plain messages.** They land in `handle_info/2` like the `'DOWN'` messages in `chat_registry`. We log them with `logger` from lesson 26. Lesson 32 adds real cleanup here.
+
+**`connected/0` filters.** `nodes()` may contain nodes we never configured, because connections are transitive. The function reports only the expected nodes that are present, so `expected() -- connected()` is the list of missing peers.
+
+Add the process to the supervision tree.
+
+**Update `src/chat_server_sup.erl`:**
+
+```erlang
+%% In src/chat_server_sup.erl, add to the list of child specs in init/1
+#{id => chat_cluster,
+  start => {chat_cluster, start_link, []}}
+```
+
+## Configuration
+
+For a release, the node list goes in the `chat_server` section of `config/sys.config`, next to the port.
+
+```erlang
+{cluster_nodes, ['chat@10.0.0.5', 'chat@10.0.0.6', 'chat@10.0.0.7']}
+```
+
+The node name and cookie are VM flags, so they go in `config/vm.args`. Each machine gets its own `-name`. The cookie is the same everywhere.
+
+```text
+-name chat@10.0.0.5
+-setcookie 5fK2pQ8xVn3LwZ7rTb1YcH6dJm9GsA4e
+```
+
+Names with an IP address or a dotted host name need `-name`. On one machine, `-sname` is enough.
+
+## Watching It Work
+
+We'll run two nodes on one machine. Both apps want a port, so each node gets its own config file. The names `a@localhost` and `b@localhost` work on any machine.
+
+**Create `config/a.config`:**
+
+```erlang
+[
+  {chat_server, [
+    {port, 8080},
+    {cluster_nodes, ['a@localhost', 'b@localhost']}
+  ]}
+].
+```
+
+Copy it to `config/b.config` and change the port to `8081`. Start the first node.
+
+```bash
+rebar3 shell --sname a@localhost --setcookie chat --config config/a.config
+```
+
+```erlang
+(a@localhost)1> chat_cluster:expected().
+[b@localhost]
+(a@localhost)2> chat_cluster:connected().
+[]
+```
+
+Node `a` is alone and retries every five seconds. Start `b` in a second terminal.
+
+```bash
+rebar3 shell --sname b@localhost --setcookie chat --config config/b.config
+```
+
+Its `chat_cluster` connects during startup, and both nodes log the event. Your log lines follow the formatter you configured in lesson 26.
+
+```erlang
+=NOTICE REPORT==== 19-Sep-2026::10:15:25.211589 ===
+cluster: b@localhost is up, connected to [b@localhost]
+(a@localhost)3> chat_cluster:connected().
+[b@localhost]
+```
+
+Now kill `b` by typing `halt().` in its shell. Node `a` sees it at once.
+
+```erlang
+=WARNING REPORT==== 19-Sep-2026::10:15:31.960623 ===
+cluster: b@localhost is down, connected to []
+(a@localhost)4> chat_cluster:connected().
+[]
+```
+
+To prove the retry timer works, bring `b` back as a bare node without the chat application. Nothing on `b` will reach out this time.
+
+```bash
+erl -sname b@localhost -setcookie chat
+```
+
+Within five seconds node `a` logs the reconnect, and `b` finds itself connected.
+
+```erlang
+=NOTICE REPORT==== 19-Sep-2026::10:15:38.211814 ===
+cluster: b@localhost is up, connected to [b@localhost]
+```
+
+```erlang
+(b@localhost)1> nodes().
+[a@localhost]
+```
+
+A closed TCP connection is detected immediately. A machine that loses power is slower. The VM notices through missed heartbeats, which takes about a minute by default. Lesson 32 covers that setting.
+
+## Other Ways to Find Nodes
+
+A static list suits a handful of servers with fixed addresses. It gets awkward when machines come and go. The alternatives differ only in where the list comes from.
+
+**Create `src/chat_discovery.erl`:**
+
+```erlang
+-module(chat_discovery).
+-export([epmd/0, dns/2]).
+
+%% Every node registered with epmd on this host, except ourselves.
+epmd() ->
+    {ok, Names} = net_adm:names(),
+    [_, Host] = string:split(atom_to_list(node()), "@"),
+    [list_to_atom(Name ++ "@" ++ Host) || {Name, _Port} <- Names] -- [node()].
+
+%% One node per A record: dns("chat", "chat.internal").
+dns(Basename, Hostname) ->
+    case inet:getaddrs(Hostname, inet) of
+        {ok, Addrs} ->
+            [list_to_atom(Basename ++ "@" ++ inet:ntoa(Addr)) || Addr <- Addrs];
+        {error, _Reason} ->
+            []
+    end.
+```
+
+### Asking epmd
+
+epmd knows every node on its host. `net_adm:names/0` returns that list, and `epmd/0` above turns it into node names. Here `b` is running, plus a node `c` started with `-setcookie other`.
+
+```erlang
+(a@localhost)1> net_adm:names().
+{ok,[{"b",62472},{"c",62473},{"a",62477}]}
+(a@localhost)2> chat_discovery:epmd().
+[b@localhost,c@localhost]
+```
+
+`net_adm:names/1` takes a host and asks the epmd there. `net_adm:world/0` builds on that. It reads host names from a file called `.hosts.erlang` in the current or home directory, asks epmd on each host, and pings every node it finds. The file holds one quoted host per line, each ending with a full stop.
+
+```erlang
+'localhost'.
+```
+
+```erlang
+(a@localhost)3> net_adm:world().
+[b@localhost,a@localhost]
+```
+
+Node `c` is missing. Its cookie differs, so the ping failed. epmd lists names for anyone who asks, but the cookie still decides who connects.
+
+### DNS
+
+Container platforms and cloud providers can publish one DNS name that resolves to the address of every running instance. Kubernetes calls this a headless service. `dns/2` resolves such a name and builds one node name per address. We can test it against `localhost`.
+
+```erlang
+(a@localhost)4> chat_discovery:dns("chat", "localhost").
+['chat@127.0.0.1']
+(a@localhost)5> chat_discovery:dns("chat", "no-such-host.invalid").
+[]
+```
+
+This only works when every node uses the same base name and takes its IP address as host, as in `-name chat@10.0.0.5`. `inet:getaddrs/2` uses the resolver of the operating system, including `/etc/hosts`. `inet_res:lookup(Name, in, a)` sends the query to the DNS servers directly. It can also fetch `srv` records, which carry host names instead of addresses.
+
+DNS answers change, so a cluster process built on `dns/2` should resolve the name on every retry, not once in `init/1`.
+
+### Hidden nodes
+
+A remote shell or a monitoring tool should connect without joining the mesh. Start it with `-hidden`.
+
+```bash
+erl -sname tool@localhost -setcookie chat -hidden
+```
+
+```erlang
+(tool@localhost)1> net_adm:ping(a@localhost).
+pong
+(tool@localhost)2> nodes().
+[]
+(tool@localhost)3> nodes(hidden).
+[a@localhost]
+```
+
+The hidden node is connected to `a` only. It was not introduced to `b` and does not show up in `nodes()` on `a`, so code that loops over `nodes()` ignores it. The `remote_console` command from lesson 25 connects this way. Hidden connections do not send `nodeup` to `chat_cluster` either, unless you subscribe with `net_kernel:monitor_nodes(true, [{node_type, all}])`.
+
+## Exercises
+
+**Exercise 1: Cluster status**
+
+Add `chat_cluster:status/0`. It returns `ok` when every expected node is connected, and the missing nodes otherwise.
+
+```erlang
+status() ->
+    % Use expected() and connected()
+    ok.
+
+% Expected with b stopped: {degraded, [b@localhost]}
+% Expected with b running: ok
+```
+
+**Exercise 2: Discovery strategies**
+
+Let `cluster_nodes` be a list of nodes, the atom `epmd` or a `dns` tuple, and resolve it on every `connect` run.
+
+```erlang
+resolve(Nodes) when is_list(Nodes) -> Nodes;
+resolve(epmd) -> chat_discovery:epmd();
+resolve({dns, Basename, Hostname}) -> chat_discovery:dns(Basename, Hostname).
+
+% Expected with {cluster_nodes, epmd}: a and b connect with no node list at all
+```
+
+**Exercise 3: Join and leave at runtime**
+
+Add `chat_cluster:add_node/1` and `chat_cluster:remove_node/1`. They change the expected list in the state. `add_node/1` connects right away. `remove_node/1` calls `erlang:disconnect_node/1`. Why would a removed node come straight back if you only disconnected it?
+
+## Key Takeaways
+
+- **The VM connects on first contact and never retries**. A cluster needs a process that makes contact and keeps trying.
+- **`net_kernel:connect_node/1`** returns `true`, `false`, or `ignored` on a VM without a node name.
+- **`net_kernel:monitor_nodes(true)`** delivers `{nodeup, Node}` and `{nodedown, Node}` as plain messages, handled in `handle_info/2`.
+- **Keep `init/1` fast**. Send yourself a message and do slow network work in `handle_info/2` so the supervisor is not blocked.
+- **A timer loop with `erlang:send_after/3`** gives periodic work. `Expected -- nodes()` is the list of nodes to retry.
+- **Discovery is about where the list comes from**. A static list in `sys.config`, epmd with `net_adm:names/0` or `net_adm:world/0`, or DNS with `inet:getaddrs/2`.
+- **The cookie still decides who connects**. Discovery only produces candidates.
+- **Hidden nodes** connect to one node without joining the mesh. Use `-hidden` for tools and remote shells.
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l30_send_after_message",
+      question: "Which message does the receive return after 50 milliseconds?",
+      code: "erlang:send_after(50, self(), connect).\nreceive Msg -> Msg after 1000 -> timeout end.\n% => ___",
+      answer: "connect",
+      hint: "The third argument of send_after/3 is the message.",
+      explanation: "erlang:send_after(Time, Pid, Msg) delivers Msg to Pid after Time milliseconds. chat_cluster uses it to schedule the next connect run."
+    },
+    {
+      id: "l30_missing_node",
+      question: "Which node is missing from the cluster?",
+      code: "Expected = [b@host, c@host].\nConnected = [b@host].\n[Missing] = Expected -- Connected.\nMissing.\n% => ___",
+      answer: "c@host",
+      hint: "The -- operator removes the elements of the right list from the left list.",
+      explanation: "Expected -- Connected leaves the nodes we should be connected to but are not. Those are the nodes to retry."
+    },
+    {
+      id: "l30_monitor_nodes",
+      question: "Which net_kernel function subscribes this process to nodeup and nodedown messages?",
+      code: "init([]) ->\n    ok = net_kernel:___(true),\n    self() ! connect,\n    {ok, #{expected => []}}.",
+      answer: "monitor_nodes",
+      hint: "The name says what it does: it monitors nodes.",
+      explanation: "net_kernel:monitor_nodes(true) makes the caller receive {nodeup, Node} and {nodedown, Node} for every connection that opens or closes."
+    },
+    {
+      id: "l30_connect_not_distributed",
+      question: "This VM has no node name. What does connect_node/1 return?",
+      code: "erlang:is_alive().\n% => false\nnet_kernel:connect_node(b@localhost).\n% => ___",
+      answer: "ignored",
+      hint: "It is neither true nor false. The request is not even attempted.",
+      explanation: "Without a node name there is no distribution, so connect_node/1 returns ignored. chat_cluster therefore does no harm in a plain rebar3 shell."
+    },
+    {
+      id: "l30_nodedown_tag",
+      question: "Which message tag must the loop match so that the lost node is reported?",
+      code: "watch(Parent) ->\n    receive\n        {nodeup, _Node} -> watch(Parent);\n        {___, Node} -> Parent ! {lost, Node}\n    end.\n\nWatcher = spawn(?MODULE, watch, [self()]).\nWatcher ! {nodeup, b@localhost}.\nWatcher ! {nodedown, b@localhost}.\nreceive {lost, Node} -> Node after 1000 -> timeout end.\n% => b@localhost",
+      answer: "nodedown",
+      hint: "The VM sends one tag when a connection opens and another when it closes.",
+      explanation: "A closed connection arrives as {nodedown, Node}. It is a plain message, so any receive or handle_info clause can match it."
+    },
+    {
+      id: "l30_dns_node_name",
+      question: "Which inet function turns an IP address tuple into a string?",
+      code: "Addr = {10,0,0,7}.\nlist_to_atom(\"chat@\" ++ inet:___(Addr)).\n% => 'chat@10.0.0.7'",
+      answer: "ntoa",
+      hint: "Network to ASCII.",
+      explanation: "inet:ntoa/1 formats an address tuple as a string. chat_discovery:dns/2 uses it to build one node name per resolved address."
+    }
+  ]}
+/>

@@ -1,0 +1,323 @@
+---
+title: "GenServer Basics"
+description: "Build a counter server with gen_server and learn its callbacks, return values, timeouts and shutdown"
+postNumber: 12
+publishDate: 2026-09-19T00:00:00Z
+tags: ["intermediate", "otp", "gen_server"]
+difficulty: "intermediate"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+Lesson 11 split a server into a generic loop and a callback module. `gen_server` is the OTP version of that generic loop. We'll use it to build `chat_stats`, a process that counts things such as messages sent and users connected. The chat server will keep it running from lesson 14 on.
+
+## The Whole Module
+
+**Create `src/chat_stats.erl`** in the `erlang_chat` project. For this lesson, start `erl` inside the `src` directory.
+
+```erlang
+-module(chat_stats).
+-behaviour(gen_server).
+
+%% Client API
+-export([start_link/0, increment/1, get/1, get_all/0, reset/0]).
+
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+
+%%% Client API. These functions run in the caller's process.
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+increment(Counter) ->
+    gen_server:cast(?MODULE, {increment, Counter}).
+
+get(Counter) ->
+    gen_server:call(?MODULE, {get, Counter}).
+
+get_all() ->
+    gen_server:call(?MODULE, get_all).
+
+reset() ->
+    gen_server:call(?MODULE, reset).
+
+%%% Callbacks. These functions run in the server process.
+
+init([]) ->
+    {ok, #{}}.
+
+handle_call({get, Counter}, _From, State) ->
+    {reply, maps:get(Counter, State, 0), State};
+handle_call(get_all, _From, State) ->
+    {reply, State, State};
+handle_call(reset, _From, _State) ->
+    {reply, ok, #{}}.
+
+handle_cast({increment, Counter}, State) ->
+    Count = maps:get(Counter, State, 0),
+    {noreply, State#{Counter => Count + 1}}.
+
+handle_info(Msg, State) ->
+    io:format("chat_stats ignored message: ~p~n", [Msg]),
+    {noreply, State}.
+
+terminate(Reason, State) ->
+    io:format("chat_stats stopping (~p) with ~p~n", [Reason, State]),
+    ok.
+```
+
+The state is a map from counter name to count. Nothing else in the module mentions processes, mailboxes or refs.
+
+## One Module, Two Processes
+
+The code in this file runs in two different processes. When a connection process calls `chat_stats:get(messages)`, the body of `get/1` runs in the connection process. `gen_server:call/2` sends a message to the server and blocks the caller until the reply arrives. The matching `handle_call/3` clause runs in the server process.
+
+This matters when something goes wrong. A crash inside `handle_call/3` kills the server. A crash inside `get/1` kills only the caller. `self()` also returns a different pid in each half.
+
+The client API exists so that no other module needs to know the message format. Callers write `chat_stats:increment(messages)`, never `gen_server:cast(chat_stats, ...)`.
+
+## Starting and Naming
+
+`gen_server:start_link/4` takes four arguments.
+
+1. `{local, ?MODULE}` registers the new process under the name `chat_stats`, like `register/2` from lesson 09. There can be only one process per name, which fits a server that exists once per node. Leave this argument out (`start_link/3`) for servers that have many instances.
+2. `?MODULE` is the callback module.
+3. `[]` is passed to `init/1`.
+4. `[]` is a list of options we do not need.
+
+`start_link` spawns the process, links it to the caller and waits until `init/1` has returned. `init/1` runs in the new process and returns `{ok, State}`. When `start_link` returns `{ok, Pid}`, the server is initialized and registered, so the next line of code can use it safely. The link is for supervisors, which lesson 14 covers.
+
+## Calls and Casts
+
+A call is a request with a reply. `handle_call/3` receives the request, a `From` value that identifies the caller, and the state. It returns `{reply, Reply, NewState}`. `gen_server` sends `Reply` back and loops with `NewState`. We rarely need `From`, so it is `_From` here.
+
+A cast is a message with no reply. `handle_cast/2` returns `{noreply, NewState}`. `gen_server:cast/2` returns `ok` immediately and the caller never waits.
+
+Use a call when the caller needs an answer or needs to know the work is done. Use a cast when neither is true. `increment/1` is a cast because a connection process should not wait for a statistics counter. `reset/0` is a call, so the counters are empty by the time it returns.
+
+```erlang
+1> c(chat_stats).
+{ok,chat_stats}
+2> {ok, Pid} = chat_stats:start_link().
+{ok,<0.91.0>}
+3> whereis(chat_stats) =:= Pid.
+true
+4> chat_stats:increment(messages).
+ok
+5> chat_stats:increment(messages).
+ok
+6> chat_stats:increment(connections).
+ok
+7> chat_stats:get(messages).
+2
+8> chat_stats:get(logins).
+0
+9> chat_stats:get_all().
+#{messages => 2,connections => 1}
+10> chat_stats ! hello.
+chat_stats ignored message: hello
+hello
+11> chat_stats:reset().
+ok
+12> chat_stats:get_all().
+#{}
+13> chat_stats:start_link().
+{error,{already_started,<0.91.0>}}
+```
+
+The casts on lines 4 to 6 are processed before the call on line 7. Messages between two processes arrive in the order they were sent, and the server handles one message at a time.
+
+Line 10 sends a plain message with `!`. Anything that is not a call or a cast goes to `handle_info/2`. Monitor `'DOWN'` messages, exit signals from trapped links, timers and TCP data all arrive this way, so later lessons use this callback a lot. Always include a catch-all clause. Without one, a stray message crashes the server with `function_clause`.
+
+## When a Call Fails
+
+`gen_server:call/2` waits 5000 milliseconds. `gen_server:call/3` takes a timeout in milliseconds, or `infinity`, as the third argument. To see a timeout we need a server that does not answer. `sys:suspend/1` pauses any OTP process, which is one of the system messages from lesson 11.
+
+Restart `erl` for this experiment and start the server without a link. An exception in the shell kills the shell process, and a linked server would die with it.
+
+```erlang
+1> gen_server:start({local, chat_stats}, chat_stats, [], []).
+{ok,<0.86.0>}
+2> chat_stats:increment(messages).
+ok
+3> sys:suspend(chat_stats).
+ok
+4> chat_stats:get(messages).
+** exception exit: {timeout,{gen_server,call,[chat_stats,{get,messages}]}}
+     in function  gen_server:call/2 (gen_server.erl:1221)
+5> sys:resume(chat_stats).
+ok
+6> chat_stats:get(messages).
+1
+```
+
+A timeout is an exit in the caller. The server is not affected. It still finds the request in its mailbox later and does the work, but the late reply is dropped. Most code lets this exit crash the caller. A server that needs more than five seconds is a problem to fix, not to hide.
+
+Now send a request that no `handle_call/3` clause matches. The stack traces are shortened here.
+
+```erlang
+7> gen_server:call(chat_stats, bogus).
+chat_stats stopping ({function_clause,[...]}) with #{messages => 1}
+=ERROR REPORT==== 19-Sep-2026::10:14:40.846472 ===
+** Generic server chat_stats terminating
+** Last message in was bogus
+** When Server state == #{messages => 1}
+** Reason for termination ==
+** {function_clause,[{chat_stats,handle_call,[bogus,...]}, ...]}
+** exception exit: {{function_clause,[...]},
+                    {gen_server,call,[chat_stats,bogus]}}
+8> chat_stats:get(messages).
+** exception exit: {noproc,{gen_server,call,[chat_stats,{get,messages}]}}
+     in function  gen_server:call/2 (gen_server.erl:1221)
+9> chat_stats:increment(messages).
+ok
+```
+
+The server crashed, `terminate/2` ran, and the log shows the last message and the state. The caller also exits, with the server's crash reason, because `gen_server:call` monitors the server while it waits. Calling a name that is not registered exits with `noproc`. A cast to a missing server returns `ok` and the message is lost, which is one more reason to prefer calls when the result matters.
+
+## Stopping
+
+Any callback can return `{stop, Reason, State}` instead of its usual tuple. `handle_call/3` can also return `{stop, Reason, Reply, State}` to answer the caller first.
+
+```erlang
+%% In src/chat_stats.erl, a possible extra clause
+handle_cast(stop, State) ->
+    {stop, normal, State};
+```
+
+`gen_server` then calls `terminate(Reason, State)` and the process exits with `Reason`. Use `normal` for a planned stop. Any other reason counts as a crash and is logged. `terminate/2` is the place to close files or sockets. It also runs after a crash in a callback, as we saw, but not when the process is killed with `exit(Pid, kill)`, so never rely on it for correctness.
+
+`gen_server:stop/1` stops a server from the outside without any extra clause.
+
+```erlang
+10> chat_stats:start_link().
+{ok,<0.99.0>}
+11> chat_stats:increment(joins).
+ok
+12> gen_server:stop(chat_stats).
+chat_stats stopping (normal) with #{joins => 1}
+ok
+```
+
+## Exercises
+
+**Exercise 1: Increment by N**
+
+Add `increment/2` so a caller can add more than one at a time, and make `increment/1` use it.
+
+```erlang
+%% In src/chat_stats.erl
+increment(Counter) ->
+    increment(Counter, 1).
+
+% Expected:
+% chat_stats:increment(bytes, 512).
+% chat_stats:increment(bytes, 100).
+% chat_stats:get(bytes).  => 612
+```
+
+**Exercise 2: Decrement**
+
+Connections close as well as open. Add `decrement/1` as a cast. A counter must never go below 0.
+
+```erlang
+% Expected:
+% chat_stats:increment(connections).
+% chat_stats:decrement(connections).
+% chat_stats:decrement(connections).
+% chat_stats:get(connections).  => 0
+```
+
+**Exercise 3: Uptime**
+
+Change the state to a map with two keys, `counters` and `started`. Set `started` in `init/1` with `erlang:monotonic_time(second)`. Add a call `uptime/0` that returns the number of seconds the server has been running. `reset/0` must not reset the start time.
+
+```erlang
+% Expected:
+% chat_stats:uptime().  => 0
+% timer:sleep(2000), chat_stats:uptime().  => 2
+```
+
+**Exercise 4: A Periodic Report**
+
+In `init/1`, call `erlang:send_after(10000, self(), report)`. Add a `handle_info(report, State)` clause above the catch-all that prints the counters and schedules the next report. Think about which process `self()` refers to inside `init/1`.
+
+```erlang
+% Expected: every 10 seconds the shell prints
+% stats: #{messages => 2}
+```
+
+## Key Takeaways
+
+- **Client API functions** run in the caller's process. Callbacks run in the server process
+- **`start_link`** returns only after `init/1` has finished, so the server is ready to use
+- **`{local, ?MODULE}`** registers the server under its module name. A second start returns `already_started`
+- **Calls** block and return the `Reply` from `{reply, Reply, NewState}`. **Casts** return `ok` at once and the callback returns `{noreply, NewState}`
+- **`handle_info/2`** receives every message that is not a call or a cast. Always add a catch-all clause
+- **A call exits the caller** with `timeout` after 5000 ms, with `noproc` when the server does not exist, and with the crash reason when the server dies during the call
+- **`{stop, Reason, State}`** ends the server and runs `terminate/2`. Use `normal` for planned stops
+- **One message at a time** means a callback never needs locks around the state
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l12_reply_tuple_tag",
+      question: "Which atom tags the return value of a call that answers the caller?",
+      code: "handle_call(get_all, _From, State) ->\n    {___, State, State}.",
+      answer: "reply",
+      hint: "The second element is sent back to the caller.",
+      explanation: "handle_call/3 returns a reply tuple with the reply and the new state. Here both are the counters map."
+    },
+    {
+      id: "l12_init_argument",
+      question: "Which start argument makes the first call return 100?",
+      code: "init(Start) ->\n    {ok, Start}.\n\nhandle_call(get, _From, Count) ->\n    {reply, Count, Count}.\n\n{ok, Pid} = gen_server:start_link(?MODULE, ___, []).\ngen_server:call(Pid, get).\n% => 100",
+      answer: "100",
+      hint: "The second argument of start_link/3 is passed to init/1.",
+      explanation: "gen_server calls init(100) in the new process. init returns it as the state and the call replies with the state."
+    },
+    {
+      id: "l12_cast_tuple_tag",
+      question: "Which atom tags the return value of a cast callback?",
+      code: "handle_cast({increment, Counter}, State) ->\n    Count = maps:get(Counter, State, 0),\n    {___, State#{Counter => Count + 1}}.",
+      answer: "noreply",
+      hint: "Nobody is waiting for an answer to a cast.",
+      explanation: "handle_cast/2 returns a noreply tuple with the new state. There is no caller to reply to."
+    },
+    {
+      id: "l12_casts_before_call",
+      question: "What does the call return after two casts?",
+      code: "init([]) ->\n    {ok, #{}}.\n\nhandle_cast({increment, Key}, State) ->\n    {noreply, State#{Key => maps:get(Key, State, 0) + 1}}.\n\nhandle_call({get, Key}, _From, State) ->\n    {reply, maps:get(Key, State, 0), State}.\n\n{ok, Pid} = gen_server:start_link(?MODULE, [], []).\ngen_server:cast(Pid, {increment, messages}).\ngen_server:cast(Pid, {increment, messages}).\ngen_server:call(Pid, {get, messages}).\n% => ___",
+      answer: "2",
+      hint: "Messages from one process to another arrive in the order they were sent.",
+      explanation: "Both casts are in the mailbox before the call, and the server handles one message at a time. The call sees the state after both increments."
+    },
+    {
+      id: "l12_plain_message_callback",
+      question: "Which callback receives a message sent with the ! operator?",
+      code: "init([]) ->\n    {ok, 0}.\n\n___(bump, Count) ->\n    {noreply, Count + 1}.\n\nhandle_call(get, _From, Count) ->\n    {reply, Count, Count}.\n\n{ok, Pid} = gen_server:start_link(?MODULE, [], []).\nPid ! bump.\ngen_server:call(Pid, get).\n% => 1",
+      answer: "handle_info",
+      hint: "It is neither a call nor a cast.",
+      explanation: "Messages that do not come from gen_server:call or gen_server:cast are passed to handle_info/2."
+    },
+    {
+      id: "l12_call_timeout_reason",
+      question: "With which reason does the caller exit when the server is too slow?",
+      code: "init([]) ->\n    {ok, idle}.\n\nhandle_call(slow, _From, State) ->\n    timer:sleep(500),\n    {reply, done, State}.\n\n{ok, Pid} = gen_server:start(?MODULE, [], []).\ntry gen_server:call(Pid, slow, 100)\ncatch exit:{Reason, _Call} -> Reason\nend.\n% => ___",
+      answer: "timeout",
+      hint: "The third argument of gen_server:call/3 is 100 milliseconds.",
+      explanation: "The server needs 500 ms but the caller waits only 100 ms. The exit reason is a tuple of timeout and a description of the call."
+    },
+    {
+      id: "l12_stop_reason",
+      question: "Which stop reason makes the monitor report a clean exit?",
+      code: "init([]) ->\n    {ok, #{}}.\n\nhandle_cast(stop, State) ->\n    {stop, ___, State}.\n\n{ok, Pid} = gen_server:start(?MODULE, [], []).\nRef = monitor(process, Pid).\ngen_server:cast(Pid, stop).\nreceive {'DOWN', Ref, process, Pid, Reason} -> Reason after 1000 -> timeout end.\n% => normal",
+      answer: "normal",
+      hint: "It is the same reason a process has when its function returns.",
+      explanation: "The Reason in a stop tuple becomes the exit reason of the process. normal is not logged as a crash."
+    }
+  ]}
+/>

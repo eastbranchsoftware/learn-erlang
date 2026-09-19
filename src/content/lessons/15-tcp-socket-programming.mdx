@@ -1,0 +1,299 @@
+---
+title: "TCP Socket Programming"
+description: "Open TCP sockets with gen_tcp, accept connections, and build an echo server that gives every client its own process"
+postNumber: 15
+publishDate: 2026-09-19T00:00:00Z
+tags: ["intermediate", "networking", "tcp"]
+difficulty: "intermediate"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+The supervision tree from lesson 14 keeps our processes alive, but nothing outside the VM can talk to them yet. A chat server needs a network connection per user. Erlang's `gen_tcp` module provides TCP sockets, and they fit the process model well. Each connection gets its own process, and incoming data can arrive as ordinary messages.
+
+## Two Kinds of Sockets
+
+A TCP server works with two kinds of sockets. A **listen socket** is bound to a port and waits for clients. Every client that connects gets its own **connection socket**, and all data flows over that one. We can play both roles in a single `erl` shell.
+
+```erlang
+1> {ok, Listen} = gen_tcp:listen(9000, [binary, {packet, raw}, {active, false}, {reuseaddr, true}]).
+{ok,#Port<0.2>}
+2> {ok, Client} = gen_tcp:connect("localhost", 9000, [binary, {active, false}]).
+{ok,#Port<0.4>}
+3> {ok, Socket} = gen_tcp:accept(Listen).
+{ok,#Port<0.5>}
+```
+
+`gen_tcp:accept/1` blocks until a client connects. Here the client was already waiting in the operating system's queue, so it returned at once. `Client` and `Socket` are the two ends of the same connection.
+
+The options decide how data is delivered.
+
+| Option | Meaning |
+| --- | --- |
+| `binary` | Deliver data as binaries. The default is lists of bytes, which waste memory. |
+| `{packet, raw}` | Deliver bytes as they arrive, with no framing. `{packet, 0}` means the same. |
+| `{packet, line}` | Deliver one full line at a time. |
+| `{active, false}` | Passive mode. We fetch data with `gen_tcp:recv/2`. |
+| `{reuseaddr, true}` | Allow a restart to bind the port again without waiting for the OS to release it. |
+
+Connection sockets inherit their options from the listen socket. Port `0` asks the OS for any free port, and `inet:port/1` tells you which one you got. That is handy in tests.
+
+## TCP Is a Byte Stream
+
+TCP delivers bytes in order, but it does not preserve message boundaries. Send twice, then read once.
+
+```erlang
+4> gen_tcp:send(Client, <<"hello ">>).
+ok
+5> gen_tcp:send(Client, <<"world">>).
+ok
+6> gen_tcp:recv(Socket, 0).
+{ok,<<"hello world">>}
+7> gen_tcp:send(Client, <<"abc">>).
+ok
+8> gen_tcp:recv(Socket, 2).
+{ok,<<"ab">>}
+9> gen_tcp:recv(Socket, 0).
+{ok,<<"c">>}
+10> gen_tcp:recv(Socket, 0, 1000).
+{error,timeout}
+```
+
+The second argument of `recv` is a byte count, and `0` means "whatever is available". Two sends came out as one binary. A large send over a real network can just as well arrive in several pieces. The receiver must never assume that one `recv` equals one message. It has to find the boundaries itself, usually by keeping a buffer of unprocessed bytes. Lessons 16 and 18 do exactly that for HTTP and WebSocket. For a line-based protocol the `{packet, line}` option does the buffering for us.
+
+## Passive and Active Mode
+
+`gen_tcp:recv` blocks the calling process. A chat connection process cannot afford that, because it must also react to messages from other processes. In **active mode** the socket sends incoming data to its owner as messages.
+
+```erlang
+11> inet:setopts(Socket, [{active, once}]).
+ok
+12> gen_tcp:send(Client, <<"first">>).
+ok
+13> flush().
+Shell got {tcp,#Port<0.5>,<<"first">>}
+ok
+14> gen_tcp:send(Client, <<"second">>).
+ok
+15> flush().
+ok
+16> inet:setopts(Socket, [{active, once}]).
+ok
+17> flush().
+Shell got {tcp,#Port<0.5>,<<"second">>}
+ok
+18> gen_tcp:close(Client).
+ok
+19> inet:setopts(Socket, [{active, once}]).
+ok
+20> flush().
+Shell got {tcp_closed,#Port<0.5>}
+ok
+```
+
+Data arrives as `{tcp, Socket, Data}`. A closed connection arrives as `{tcp_closed, Socket}`.
+
+There are three settings. With `{active, true}` every packet becomes a message immediately. A fast or malicious client can then fill the mailbox faster than the process handles it, and memory grows without limit. With `{active, false}` nothing is pushed, but we have to block in `recv`. `{active, once}` delivers one message and then switches the socket back to passive. Unread data stays in the OS buffer, the TCP window fills up, and the sender has to slow down. That is flow control. The process asks for the next message only when it is ready for it, as prompt 16 shows.
+
+## The Socket Owner
+
+Active mode messages go to one process, the **controlling process**. At first that is the process that called `accept`. If a different process should handle the connection, ownership must be handed over with `gen_tcp:controlling_process/2`. Only the current owner can do that. A socket is also linked to its owner. When the owner dies, the socket closes, so a crashed connection process never leaks a socket.
+
+## The Echo Server
+
+The server has one acceptor process that loops on `accept`. For each client it spawns a handler, transfers ownership, and goes straight back to accepting. A slow client never delays the next one. The demo uses `{packet, line}` so every message is one line of text.
+
+**Create `echo_server.erl`:**
+
+```erlang
+-module(echo_server).
+-export([start/0, start/1]).
+
+start() ->
+    start(8080).
+
+start(Port) ->
+    spawn(fun() -> listen(Port) end).
+
+listen(Port) ->
+    Options = [binary, {packet, line}, {active, false}, {reuseaddr, true}],
+    {ok, ListenSocket} = gen_tcp:listen(Port, Options),
+    io:format("Echo server listening on port ~p~n", [Port]),
+    accept_loop(ListenSocket).
+
+accept_loop(ListenSocket) ->
+    {ok, Socket} = gen_tcp:accept(ListenSocket),
+    Pid = spawn(fun() -> wait_for_socket() end),
+    ok = gen_tcp:controlling_process(Socket, Pid),
+    Pid ! {socket, Socket},
+    accept_loop(ListenSocket).
+
+wait_for_socket() ->
+    receive
+        {socket, Socket} ->
+            io:format("~p: client connected~n", [self()]),
+            loop(Socket)
+    end.
+
+loop(Socket) ->
+    ok = inet:setopts(Socket, [{active, once}]),
+    receive
+        {tcp, Socket, <<"quit", _/binary>>} ->
+            gen_tcp:send(Socket, <<"bye\n">>),
+            gen_tcp:close(Socket);
+        {tcp, Socket, Line} ->
+            gen_tcp:send(Socket, [<<"echo: ">>, Line]),
+            loop(Socket);
+        {tcp_closed, Socket} ->
+            io:format("~p: client disconnected~n", [self()]);
+        {tcp_error, Socket, Reason} ->
+            io:format("~p: socket error ~p~n", [self(), Reason])
+    end.
+```
+
+The listen socket is passive, so accepted sockets start passive too. No data can be delivered to the acceptor by accident. The handler waits for the `{socket, Socket}` message, which is sent only after the ownership transfer, and then enables `{active, once}` itself. `gen_tcp:send/2` accepts iodata, so we send a list of two binaries instead of building a new one.
+
+Start it in the shell.
+
+```erlang
+1> c(echo_server).
+{ok,echo_server}
+2> echo_server:start().
+<0.91.0>
+Echo server listening on port 8080
+```
+
+Connect from another terminal with `nc` (or `telnet localhost 8080`).
+
+```bash
+$ nc localhost 8080
+hello
+echo: hello
+how are you?
+echo: how are you?
+quit
+bye
+```
+
+Open a second `nc` while the first is still connected. Both work at the same time, each with its own process. Close one with Ctrl+C and the Erlang shell reports it.
+
+```text
+<0.93.0>: client connected
+<0.94.0>: client connected
+<0.94.0>: client disconnected
+```
+
+## Exercises
+
+**Exercise 1: Passive handler**
+
+Rewrite `loop/1` to use `gen_tcp:recv/2` instead of active mode. Does the handler still need `controlling_process`? What happens to the socket if the handler crashes?
+
+```erlang
+loop(Socket) ->
+    case gen_tcp:recv(Socket, 0) of
+        % {ok, Line} -> ...
+        % {error, closed} -> ...
+    end.
+```
+
+**Exercise 2: Idle timeout**
+
+Disconnect clients that send nothing for 30 seconds. Add an `after` clause to the `receive` in `loop/1`.
+
+```erlang
+% Expected in nc after 30 idle seconds:
+% idle timeout, goodbye
+```
+
+**Exercise 3: See the byte stream**
+
+Change the listen options to `{packet, raw}` and print every binary the handler receives. Paste several lines into `nc` at once.
+
+```erlang
+% Expected: one {tcp, Socket, Data} message can contain several lines,
+% for example <<"one\ntwo\nthree\n">>
+```
+
+**Exercise 4: Count connections**
+
+Make the acceptor pass a connection number to each handler and include it in the log output.
+
+```erlang
+% Expected: accept_loop(ListenSocket, Count)
+% #1: client connected
+% #2: client connected
+```
+
+## Key Takeaways
+
+- **Listen socket and connection sockets** are different things. `gen_tcp:listen/2` opens the port and every `gen_tcp:accept/1` returns a new socket for one client
+- **One process per connection** keeps clients independent. The acceptor only accepts and hands the socket over
+- **Passive mode** uses the blocking `gen_tcp:recv/2`. Active mode delivers `{tcp, Socket, Data}` and `{tcp_closed, Socket}` messages
+- **`{active, once}`** gives flow control. The process re-arms the socket when it is ready, so a fast client cannot flood the mailbox
+- **The controlling process** receives the messages and keeps the socket alive. Hand it over with `gen_tcp:controlling_process/2`
+- **TCP is a byte stream**. Sends can arrive merged or split, so protocols need framing and receivers need a buffer
+- **`binary` mode and iodata** keep network code cheap. Send lists of binaries without concatenating them
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l15_recv_result",
+      question: "What does recv return for the data the client sent?",
+      code: '{ok, Listen} = gen_tcp:listen(0, [binary, {active, false}]).\n{ok, Port} = inet:port(Listen).\n{ok, Client} = gen_tcp:connect("localhost", Port, [binary]).\n{ok, Socket} = gen_tcp:accept(Listen).\nok = gen_tcp:send(Client, <<"hi">>).\ngen_tcp:recv(Socket, 0, 1000).\n% => {ok, ___}',
+      answer: '<<"hi">>',
+      hint: "The listen socket was opened with the binary option.",
+      explanation: "In binary mode recv returns the received bytes as a binary inside an ok tuple."
+    },
+    {
+      id: "l15_closed_error",
+      question: "What error reason does recv return after the client closed the connection?",
+      code: '{ok, Listen} = gen_tcp:listen(0, [binary, {active, false}]).\n{ok, Port} = inet:port(Listen).\n{ok, Client} = gen_tcp:connect("localhost", Port, [binary]).\n{ok, Socket} = gen_tcp:accept(Listen).\nok = gen_tcp:close(Client).\ngen_tcp:recv(Socket, 0, 1000).\n% => {error, ___}',
+      answer: "closed",
+      hint: "The echo server's passive handler matches on the same tuple.",
+      explanation: "When the peer closes the connection, a passive recv returns {error, closed}."
+    },
+    {
+      id: "l15_recv_length",
+      question: "The client sends twice. What does a recv of exactly 3 bytes return?",
+      code: '{ok, Listen} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false}]).\n{ok, Port} = inet:port(Listen).\n{ok, Client} = gen_tcp:connect("localhost", Port, [binary]).\n{ok, Socket} = gen_tcp:accept(Listen).\nok = gen_tcp:send(Client, <<"ab">>).\nok = gen_tcp:send(Client, <<"cd">>).\ngen_tcp:recv(Socket, 3, 1000).\n% => {ok, ___}',
+      answer: '<<"abc">>',
+      hint: "TCP does not remember where one send ended and the next began.",
+      explanation: "TCP is a byte stream. recv with a length returns exactly that many bytes, regardless of how the sender split them."
+    },
+    {
+      id: "l15_active_message_tag",
+      question: "Which atom tags the message that carries data from an active socket?",
+      code: '{ok, Listen} = gen_tcp:listen(0, [binary, {active, false}]).\n{ok, Port} = inet:port(Listen).\n{ok, Client} = gen_tcp:connect("localhost", Port, [binary]).\n{ok, Socket} = gen_tcp:accept(Listen).\nok = inet:setopts(Socket, [{active, once}]).\nok = gen_tcp:send(Client, <<"ping">>).\nreceive {___, Socket, Data} -> Data after 1000 -> timeout end.\n% => <<"ping">>',
+      answer: "tcp",
+      hint: "The other two messages are tcp_closed and tcp_error.",
+      explanation: "An active socket delivers data to its owner as {tcp, Socket, Data}."
+    },
+    {
+      id: "l15_packet_line",
+      question: "Which packet option makes recv return one line at a time?",
+      code: '{ok, Listen} = gen_tcp:listen(0, [binary, {packet, ___}, {active, false}]).\n{ok, Port} = inet:port(Listen).\n{ok, Client} = gen_tcp:connect("localhost", Port, [binary]).\n{ok, Socket} = gen_tcp:accept(Listen).\nok = gen_tcp:send(Client, <<"one\\ntwo\\n">>).\ngen_tcp:recv(Socket, 0, 1000).\n% => {ok, <<"one\\n">>}',
+      answer: "line",
+      hint: "The echo server uses the same option.",
+      explanation: "With {packet, line} the socket buffers bytes and delivers them one complete line at a time."
+    },
+    {
+      id: "l15_active_once_rearm",
+      question: "Which value re-arms the socket for exactly one more message?",
+      code: "loop(Socket) ->\n    ok = inet:setopts(Socket, [{active, ___}]),\n    receive\n        {tcp, Socket, Line} ->\n            gen_tcp:send(Socket, Line),\n            loop(Socket);\n        {tcp_closed, Socket} ->\n            ok\n    end.",
+      answer: "once",
+      hint: "true would flood the mailbox, false would deliver nothing.",
+      explanation: "{active, once} delivers one message and turns the socket passive again, which gives the process flow control."
+    },
+    {
+      id: "l15_controlling_process",
+      question: "Which gen_tcp function makes the handler the owner, so it receives the data?",
+      code: '{ok, Listen} = gen_tcp:listen(0, [binary, {active, false}]).\n{ok, Port} = inet:port(Listen).\n{ok, Client} = gen_tcp:connect("localhost", Port, [binary]).\n{ok, Socket} = gen_tcp:accept(Listen).\nParent = self().\nHandler = spawn(fun() ->\n    receive {tcp, _, Data} -> Parent ! {handler_got, Data}\n    after 1000 -> Parent ! handler_timeout end\nend).\nok = gen_tcp:___(Socket, Handler).\nok = inet:setopts(Socket, [{active, once}]).\nok = gen_tcp:send(Client, <<"yo">>).\nreceive Msg -> Msg after 2000 -> timeout end.\n% => {handler_got, <<"yo">>}',
+      answer: "controlling_process",
+      hint: "Active mode messages go to the socket's owner.",
+      explanation: "gen_tcp:controlling_process/2 transfers ownership, so the {tcp, ...} message goes to Handler instead of the process that called accept."
+    }
+  ]}
+/>

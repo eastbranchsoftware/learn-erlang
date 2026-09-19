@@ -1,0 +1,333 @@
+---
+title: "Distributed Systems Basics"
+description: "Connect Erlang nodes, send messages between them, and run code on a remote node"
+postNumber: 29
+publishDate: 2026-09-19T00:00:00Z
+tags: ["advanced", "distributed", "nodes"]
+difficulty: "advanced"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+Lesson 28 made chat history survive a restart. The server still runs on one machine, so one hardware failure takes every room offline. Erlang was built to run one system across several machines, and the tools for that ship with the VM. Everything you know about processes and messages keeps working. The only new idea is the node.
+
+## Nodes
+
+A node is a running Erlang VM that has a name. Open two terminals and start one node in each.
+
+```bash
+# terminal 1
+erl -sname alice -setcookie chat
+
+# terminal 2
+erl -sname bob -setcookie chat
+```
+
+The prompt now shows the node name. Your host name appears where ours says `mac`.
+
+```erlang
+(alice@mac)1> node().
+alice@mac
+(alice@mac)2> nodes().
+[]
+```
+
+`node/0` returns the name of the local node as an atom. `nodes/0` lists the nodes we are connected to. Starting a node does not connect it to anything, so the list is empty.
+
+A node name is an atom, and atoms with a dash need quotes. If your host is called `my-laptop`, write `'bob@my-laptop'`.
+
+## Connecting
+
+Nodes connect the first time one of them talks to the other. `net_adm:ping/1` is the simplest way to force that.
+
+```erlang
+(alice@mac)3> Bob = bob@mac.
+bob@mac
+(alice@mac)4> net_adm:ping(Bob).
+pong
+(alice@mac)5> nodes().
+[bob@mac]
+(alice@mac)6> net_adm:ping(nobody@mac).
+pang
+```
+
+`pong` means the connection is up. `pang` means it failed. The node may not exist, the host may be unreachable, or the cookies may differ.
+
+How did `alice` find `bob`? Each node listens on a random TCP port. A small daemon called epmd (Erlang Port Mapper Daemon) starts with the first node on a host and listens on port 4369. Nodes register their name and port with it. To reach `bob@mac`, `alice` asks epmd on host `mac` which port `bob` uses, then connects to that port. Run `epmd -names` in a terminal to see what it knows.
+
+### The mesh
+
+Start a third node with `erl -sname carol -setcookie chat` and ping only `alice` from it. Then look at `bob`.
+
+```erlang
+(bob@mac)1> nodes().
+[alice@mac,carol@mac]
+```
+
+`bob` never pinged `carol`. Connections are transitive by default. When `carol` joined `alice`, she learned about `bob` and connected to him too. Every node ends up connected to every other node, a full mesh. The connection count grows with the square of the node count, which is why Erlang clusters usually stay below a few dozen nodes. Stop `carol` with `q().` before you continue.
+
+### Short and long names
+
+`-sname` gives a short name, where the host part has no dots. `-name chat@10.0.0.5` or `-name chat@web1.example.com` gives a long name with a full host name or IP address. A cluster uses one kind or the other. They do not mix.
+
+A short-name node that pings `'x@127.0.0.1'` logs `Hostname 127.0.0.1 is illegal` and returns `pang`.
+
+Short names are fine on one machine or one local network. Use long names with DNS or IP addresses.
+
+## Sending Messages to Another Node
+
+A registered name is local to its node. To reach a registered process elsewhere, send to a `{Name, Node}` tuple. Register the shell process on `bob` first.
+
+```erlang
+(bob@mac)2> register(bob_shell, self()).
+true
+```
+
+Send from `alice`, then check the mailbox on `bob`.
+
+```erlang
+(alice@mac)7> {bob_shell, Bob} ! {hello, from, node()}.
+{hello,from,alice@mac}
+```
+
+```erlang
+(bob@mac)3> flush().
+Shell got {hello,from,alice@mac}
+ok
+```
+
+The `!` operator is the same one from lesson 9. The VM serialises the term, sends it over TCP, and the other VM puts it in the mailbox. Like a local send, it never fails. If the node is gone the message is dropped.
+
+## Pids Work Everywhere
+
+Pids are location transparent. A pid carries the node it lives on, so you can send a pid to another node and reply to it from there. On `bob`, wait for a ping and answer whoever sent it.
+
+```erlang
+(bob@mac)4> receive {From, ping} -> From ! {pong, node()} end.
+```
+
+The shell blocks. Send the ping from `alice`, with her own pid inside.
+
+```erlang
+(alice@mac)8> {bob_shell, Bob} ! {self(), ping}.
+{<0.90.0>,ping}
+(alice@mac)9> flush().
+Shell got {pong,bob@mac}
+ok
+```
+
+Back on `bob`, look at the pid that arrived.
+
+```erlang
+{pong,bob@mac}
+(bob@mac)5> From.
+<10877.90.0>
+(bob@mac)6> node(From).
+alice@mac
+```
+
+On `alice` the pid prints as `<0.90.0>`. On `bob` the first number is no longer 0, which marks it as remote. `node/1` tells you where a pid lives. The code that replied, `From ! {pong, node()}`, has no idea the pid is remote. A `chat_room` that holds member pids can broadcast to them wherever they run.
+
+## Running Code on Another Node
+
+`spawn/2` takes a node and a fun and starts the process over there.
+
+```erlang
+(alice@mac)10> spawn(Bob, fun() -> io:format("running on ~p~n", [node()]) end).
+<10606.102.0>
+running on bob@mac
+```
+
+The process ran on `bob`, yet the text appeared in the terminal of `alice`. A spawned process inherits its group leader, the process that handles its output, from the spawner.
+
+The remote node needs the code. A shell fun works because `erl_eval` exists everywhere. For your own modules, `spawn(Node, Module, Function, Args)` requires the compiled module on the remote node's code path.
+
+For a plain function call with a return value, use `erpc:call/4`.
+
+```erlang
+(alice@mac)11> erpc:call(Bob, erlang, node, []).
+bob@mac
+(alice@mac)12> erpc:call(Bob, lists, sum, [[1,2,3]]).
+6
+(alice@mac)13> erpc:call(Bob, erlang, error, [boom]).
+** exception error: {exception,boom,[{erlang,error,[boom],[]}]}
+     in function  erpc:call/5 (erpc.erl:1380)
+```
+
+An exception on the remote side is raised again in the caller. If the node is unreachable you get `{erpc, noconnection}`. You will see `rpc:call/4` in older code. It returns `{badrpc, Reason}` instead of raising, so a failure can be confused with a real return value. Prefer `erpc`.
+
+## Monitors Across Nodes
+
+Monitors from lesson 10 work on remote pids, and `exit(Pid, kill)` kills a remote process like a local one. There is one new exit reason. Spawn and monitor a process on `bob`, then stop the whole `bob` node with `q().` and look at the mailbox on `alice`.
+
+```erlang
+(alice@mac)14> Pid = spawn(Bob, fun() -> receive stop -> ok end end).
+<10606.124.0>
+(alice@mac)15> erlang:monitor(process, Pid).
+#Ref<0.3595529185.3618111489.71067>
+(alice@mac)16> flush().
+Shell got {'DOWN',#Ref<0.3595529185.3618111489.71067>,process,<10606.124.0>,
+                  noconnection}
+ok
+(alice@mac)17> nodes().
+[]
+```
+
+`noconnection` means the connection to the node was lost. The process may have died with its node, or it may be alive behind a broken network. From `alice` the two cases look the same. `chat_registry` and `chat_room` already clean up on any `'DOWN'` message, so they handle remote members for free.
+
+## What the Cookie Is
+
+Two nodes connect only if they present the same cookie. `-setcookie chat` sets it. Without the flag, Erlang uses the contents of `~/.erlang.cookie` and creates that file with a random value on first use. A node with a different cookie gets `pang`, and the target logs a rejected connection attempt.
+
+The cookie is a shared password that keeps clusters apart. It is not encryption. Traffic between nodes travels as plain TCP. It is not a permission system either. Any node that knows the cookie can call `erpc:call(Node, os, cmd, ["cat ~/.ssh/id_rsa"])`, or anything worse. A connected node has full control of every other node.
+
+So treat the distribution port like a root shell. Keep epmd and the node ports off the public internet, behind a firewall or on a private network. Put a long random cookie in `vm.args` from lesson 25. Erlang can also run distribution over TLS (`-proto_dist inet_tls`), which adds encryption and certificate checks.
+
+## A Two-Node Chat
+
+Each node runs a registered `relay` process that prints what it receives.
+
+**Create `relay.erl`:**
+
+```erlang
+-module(relay).
+-export([start/0, say/2]).
+
+start() ->
+    Pid = spawn(fun loop/0),
+    register(relay, Pid),
+    {ok, Pid}.
+
+say(Node, Text) ->
+    {relay, Node} ! {say, node(), Text},
+    ok.
+
+loop() ->
+    receive
+        {say, From, Text} ->
+            io:format("[~s] ~s~n", [From, Text]),
+            loop()
+    end.
+```
+
+Start both nodes from the directory with `relay.erl`, and run these two lines on each.
+
+```erlang
+(bob@mac)1> c(relay).
+{ok,relay}
+(bob@mac)2> relay:start().
+{ok,<0.121.0>}
+```
+
+Now talk. Nobody pings first. The send itself sets up the connection.
+
+```erlang
+(alice@mac)3> relay:say(bob@mac, "hello from alice").
+ok
+[bob@mac] hi alice, bob here
+```
+
+```erlang
+[alice@mac] hello from alice
+(bob@mac)3> relay:say(alice@mac, "hi alice, bob here").
+ok
+```
+
+The same name, `relay`, is registered on both nodes without conflict, and `{relay, Node}` picks one. Lesson 31 uses exactly this to let a chat room span nodes. The room process on one node forwards each message to the room processes on the others.
+
+## Exercises
+
+**Exercise 1: Broadcast to every node**
+
+Add `relay:say_all/1` that sends the text to the relay on every connected node.
+
+```erlang
+say_all(Text) ->
+    % Send {say, node(), Text} to {relay, Node} for each Node in nodes()
+    ok.
+
+% relay:say_all("lunch?").
+% Expected: "[alice@mac] lunch?" printed on every other node
+```
+
+**Exercise 2: Who is where**
+
+Write `where/1`. It takes a list of pids and returns a map from node name to the number of pids on that node.
+
+```erlang
+where(Pids) ->
+    % Hint: node/1 and maps:update_with/4
+    #{}.
+
+% Expected with two local pids and one spawned on bob:
+% #{alice@mac => 2, bob@mac => 1}
+```
+
+**Exercise 3: Notice a lost node**
+
+`erlang:monitor_node(Node, true)` sends `{nodedown, Node}` to the caller when the connection drops. Monitor `bob` from `alice`, stop `bob`, and check the mailbox with `flush()`. Then monitor a node that does not exist. What arrives, and how fast?
+
+## Key Takeaways
+
+- **A node is a named VM**. Start one with `-sname` or `-name`. `node/0` returns its name and `nodes/0` lists connected nodes.
+- **Connections are lazy and transitive**. The first ping, send or call connects two nodes, and the rest of the mesh follows.
+- **Send with `{Name, Node} ! Msg`** to reach a registered process on another node. Sends to a dead node are dropped silently.
+- **Pids are location transparent**. Send, monitor and `exit/2` behave the same for local and remote pids. `node/1` tells you where a pid lives.
+- **Use `erpc:call/4` for remote calls**. It raises on failure instead of returning `{badrpc, Reason}` like the older `rpc`.
+- **`noconnection` means the link to the node is gone**. You cannot tell a crashed node from a broken network.
+- **The cookie is not security**. Anyone who has it can run any code on your nodes. Keep distribution ports private and use TLS distribution on untrusted networks.
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l29_node_without_name",
+      question: "This VM was started with plain erl, without -sname or -name. What does node() return?",
+      code: "node().\n% => ___",
+      answer: "nonode@nohost",
+      hint: "A VM without a name still answers node/0 with a placeholder atom.",
+      explanation: "A VM that is not distributed reports nonode@nohost. It cannot connect to other nodes until it has a name."
+    },
+    {
+      id: "l29_ping_result",
+      question: "No node called ghost exists. What does the ping return?",
+      code: "net_adm:ping(ghost@nowhere).\n% => ___",
+      answer: "pang",
+      hint: "A successful ping returns pong.",
+      explanation: "net_adm:ping/1 returns pong when the connection is up and pang when it cannot be set up."
+    },
+    {
+      id: "l29_build_node_name",
+      question: "What node name does this expression build?",
+      code: "Host = \"mac\".\nlist_to_atom(\"bob\" ++ \"@\" ++ Host).\n% => ___",
+      answer: "bob@mac",
+      hint: "Node names are plain atoms of the form name@host.",
+      explanation: "A node name is an atom, so you can build one from strings with list_to_atom/1."
+    },
+    {
+      id: "l29_pid_node",
+      question: "Which function returns the node a pid lives on?",
+      code: "Pid = spawn(fun() -> receive stop -> ok end end).\n___(Pid) =:= node().\n% => true",
+      answer: "node",
+      hint: "It has the same name as the function that returns the local node name, with one argument.",
+      explanation: "node/1 returns the node of a pid, port or reference. A pid spawned locally lives on the local node."
+    },
+    {
+      id: "l29_send_name_node",
+      question: "Which registered name completes the send so the message arrives?",
+      code: "register(l29_relay, self()).\n{___, node()} ! {say, <<\"hi\">>}.\nreceive {say, Text} -> Text after 1000 -> timeout end.\n% => <<\"hi\">>",
+      answer: "l29_relay",
+      hint: "The tuple is {RegisteredName, Node}.",
+      explanation: "{Name, Node} ! Msg sends to the process registered as Name on Node. Using node() as the node reaches the local registry."
+    },
+    {
+      id: "l29_noconnection",
+      question: "A room monitors a member pid on another node. Which exit reason arrives when the connection to that node is lost?",
+      code: "handle_info({'DOWN', _Ref, process, Pid, ___}, State) ->\n    logger:warning(\"lost the node of ~p\", [Pid]),\n    {noreply, State}.",
+      answer: "noconnection",
+      hint: "It is the reason we saw after stopping the bob node.",
+      explanation: "A monitor on a remote pid fires with reason noconnection when the link between the nodes goes down."
+    }
+  ]}
+/>
