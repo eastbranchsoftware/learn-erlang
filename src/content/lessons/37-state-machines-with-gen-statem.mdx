@@ -1,0 +1,325 @@
+---
+title: "State Machines with gen_statem"
+description: "Model the connection lifecycle as explicit states with gen_statem, including a login timeout that cancels itself"
+postNumber: 37
+publishDate: 2026-09-19T00:00:00Z
+tags: ["advanced", "otp", "gen_statem"]
+difficulty: "advanced"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+Lesson 11 listed `gen_statem` among the standard behaviours. We never used it, but we did write a state machine by hand. `chat_connection` has a `phase` field that is `http` or `websocket`, and `handle_message/2` has a gate clause matching `username = undefined`. Every handler first works out which state the process is in. `gen_statem` makes the state a first class value and dispatches events by it.
+
+## The Shape of a gen_statem
+
+A gen_statem separates two things that our `#state` record mixed together. The **state** says where in the lifecycle the process is, such as `unauthenticated`. The **data** is everything else, such as the socket and the username.
+
+`callback_mode/0` picks how events reach our code.
+
+- `state_functions`: the state is an atom and each state is a function. An event in state `authenticated` calls `authenticated(EventType, Event, Data)`.
+- `handle_event_function`: one function `handle_event(EventType, Event, State, Data)` handles everything, and the state can be any term, for example `{in_room, <<"erlang">>}`. A clause that ignores `State` covers every state at once.
+
+Adding `state_enter`, as in `[state_functions, state_enter]`, also calls the state function with `(enter, OldState, Data)` on every state change.
+
+`init/1` returns `{ok, State, Data}`. Every event carries a type.
+
+| Event type | Source |
+| --- | --- |
+| `{call, From}` | `gen_statem:call/2` |
+| `cast` | `gen_statem:cast/2` |
+| `info` | a plain message such as `{tcp, Socket, Bytes}` |
+| `state_timeout`, `timeout` | timers started by actions |
+| `internal` | the action `{next_event, internal, Event}` |
+
+A callback returns `{next_state, NewState, NewData}`, `{keep_state, NewData}`, `keep_state_and_data`, or `{stop, Reason}`. The first three take an optional list of **actions** as the last element. A reply is an action, so one return value can answer a call and change the state.
+
+## A Session in Three States
+
+We'll build the lifecycle without sockets first, so the shell can drive it. A session starts `unauthenticated`, becomes `authenticated` after a login, and waits a second in `closing` before it stops. Use plain `erl`. A literal password stands in for `chat_auth:login/2`.
+
+**Create `chat_session.erl`:**
+
+```erlang
+-module(chat_session).
+-behaviour(gen_statem).
+
+-export([start_link/1, login/3, send/2, logout/1]).
+-export([callback_mode/0, init/1]).
+-export([unauthenticated/3, authenticated/3, closing/3]).
+
+start_link(LoginTimeout) ->
+    gen_statem:start_link(?MODULE, LoginTimeout, []).
+
+login(Pid, Name, Password) ->
+    gen_statem:call(Pid, {login, Name, Password}).
+
+send(Pid, Text) ->
+    gen_statem:call(Pid, {send, Text}).
+
+logout(Pid) ->
+    gen_statem:cast(Pid, logout).
+
+callback_mode() ->
+    state_functions.
+
+init(LoginTimeout) ->
+    Data = #{username => undefined, sent => 0},
+    {ok, unauthenticated, Data, [{state_timeout, LoginTimeout, login}]}.
+
+%% State: unauthenticated
+unauthenticated({call, From}, {login, Name, <<"correct horse">>}, Data) ->
+    {next_state, authenticated, Data#{username := Name},
+     [{reply, From, ok}]};
+unauthenticated({call, From}, {login, _Name, _Password}, _Data) ->
+    {keep_state_and_data, [{reply, From, {error, invalid_credentials}}]};
+unauthenticated({call, From}, {send, _Text}, _Data) ->
+    {keep_state_and_data, [{reply, From, {error, not_authenticated}}]};
+unauthenticated(info, {chat_event, _Event}, _Data) ->
+    {keep_state_and_data, [postpone]};
+unauthenticated(state_timeout, login, _Data) ->
+    io:format("no login, giving up~n"),
+    {stop, normal};
+unauthenticated(cast, logout, _Data) ->
+    {stop, normal}.
+
+%% State: authenticated
+authenticated({call, From}, {send, Text}, #{username := Name, sent := Sent} = Data) ->
+    io:format("~s says: ~s~n", [Name, Text]),
+    {keep_state, Data#{sent := Sent + 1}, [{reply, From, ok}]};
+authenticated(info, {chat_event, Event}, #{username := Name}) ->
+    io:format("deliver to ~s: ~p~n", [Name, Event]),
+    keep_state_and_data;
+authenticated(cast, logout, Data) ->
+    {next_state, closing, Data, [{state_timeout, 1000, close}]}.
+
+%% State: closing
+closing({call, From}, _Request, _Data) ->
+    {keep_state_and_data, [{reply, From, {error, closing}}]};
+closing(state_timeout, close, _Data) ->
+    {stop, normal};
+closing(_EventType, _Event, _Data) ->
+    keep_state_and_data.
+```
+
+There is no gate clause. `{send, Text}` in the wrong state reaches a different function, and no clause asks "am I logged in?".
+
+```erlang
+1> c(chat_session).
+{ok,chat_session}
+2> {ok, S} = chat_session:start_link(30000).
+{ok,<0.91.0>}
+3> sys:get_state(S).
+{unauthenticated,#{sent => 0,username => undefined}}
+4> chat_session:send(S, <<"hello?">>).
+{error,not_authenticated}
+5> S ! {chat_event, #{type => system, text => <<"bob joined">>}}.
+{chat_event,#{type => system,text => <<"bob joined">>}}
+6> chat_session:login(S, <<"alice">>, <<"correct horse">>).
+deliver to alice: #{type => system,text => <<"bob joined">>}
+ok
+7> chat_session:send(S, <<"hello!">>).
+alice says: hello!
+ok
+8> sys:get_state(S).
+{authenticated,#{sent => 1,username => <<"alice">>}}
+9> chat_session:logout(S).
+ok
+10> chat_session:send(S, <<"still there?">>).
+{error,closing}
+```
+
+`sys:get_state/1` returns `{State, Data}`. Line 5 shows `postpone`. The event arrived before the session could deliver it. The `postpone` action puts it aside, and gen_statem replays postponed events after the next state change. It printed on line 6, right after the login. A gen_server would need its own queue for this. Postpone only events that a later state handles, or they stay in memory forever.
+
+## Timeouts Belong to States
+
+"Drop clients that do not log in within 30 seconds" is awkward in a gen_server. We would have to start a timer with `erlang:send_after/3`, keep the reference, cancel it on login, and ignore a timeout message that was already in the mailbox.
+
+The action `{state_timeout, Ms, Content}` does all of that. It delivers the event `(state_timeout, Content, Data)` after `Ms` milliseconds in the current state. When the state changes, gen_statem cancels the timer. The session above logged in, so its timer never fired. Start one with a short timeout and leave it alone.
+
+```erlang
+11> {ok, S2} = chat_session:start_link(2000).
+{ok,<0.101.0>}
+12> timer:sleep(2500).
+no login, giving up
+ok
+13> is_process_alive(S2).
+false
+```
+
+Two more timers exist. `{timeout, Ms, Content}` is an event timeout. Any event cancels it, so it measures silence. `{{timeout, Name}, Ms, Content}` is a generic timeout that runs until it fires or is replaced. Exercise 2 uses both for idle detection.
+
+## Mapping chat_connection onto States
+
+The connection has the states `http`, `unauthenticated` and `authenticated`. The `phase` field and the `username = undefined` checks disappear. Socket data arrives as `info` events. These are the clauses that change. The helpers from lesson 19 keep their bodies and return gen_statem tuples.
+
+```erlang
+%% In src/chat_connection_fsm.erl
+-record(data, {socket, buffer = <<>>, username, rooms = []}).
+
+-define(LOGIN_TIMEOUT, 30000).
+
+init(Socket) ->
+    {ok, http, #data{socket = Socket}}.
+
+http(cast, socket_ready, Data) ->
+    activate(Data);
+http(EventType, Event, Data) ->
+    handle_common(EventType, Event, Data).
+
+%% Every state function ends with the same catch-all clause.
+handle_common(info, {tcp, Socket, Bytes}, #data{socket = Socket, buffer = Buffer} = Data) ->
+    {keep_state, Data#data{buffer = <<Buffer/binary, Bytes/binary>>},
+     [{next_event, internal, parse}]};
+handle_common(info, {tcp_closed, _Socket}, _Data) ->
+    {stop, normal};
+handle_common(_EventType, _Event, _Data) ->
+    keep_state_and_data.
+```
+
+New bytes go into the buffer and the machine queues an `internal` event `parse` for itself. Internal events jump ahead of the mailbox. The `http` state gets a `parse` clause that reads a request with the body of the old `process/1`. In the other two states a `parse` clause in `handle_common/3` decodes a frame and queues `{next_event, internal, {message, Map}}` with the decoded JSON.
+
+The successful upgrade in `handle_request/2` is the first state change. It starts the login timer and parses again, because frames may already be buffered.
+
+```erlang
+%% In src/chat_connection_fsm.erl
+            {next_state, unauthenticated, Data,
+             [{state_timeout, ?LOGIN_TIMEOUT, login},
+              {next_event, internal, parse}]};
+```
+
+The gate clause of `handle_message/2` becomes a state. Its `register`, `login` and `auth` clauses come first and look like the old ones. The rest is new.
+
+```erlang
+%% In src/chat_connection_fsm.erl
+unauthenticated(internal, {message, _Other}, Data) ->
+    send_error(not_authenticated, Data),
+    keep_state_and_data;
+unauthenticated(state_timeout, login, Data) ->
+    send_frame({close, <<1008:16, "login timeout">>}, Data),
+    {stop, normal};
+unauthenticated(EventType, Event, Data) ->
+    handle_common(EventType, Event, Data).
+```
+
+`enter_chat/3` returns `{next_state, authenticated, NewData}` on success, which cancels the login timer. Exercise 3 completes the port. With `?LOGIN_TIMEOUT` set to 2000 and `ws_client` from lesson 24 loaded by `rebar3 as test shell`, a client that only connects gets this.
+
+```erlang
+1> {ok, A} = ws_client:connect(8080).
+{ok,#Port<0.6>}
+2> [{_, Conn, _, _}] = supervisor:which_children(chat_conn_sup).
+[{undefined,<0.102.0>,worker,[chat_connection_fsm]}]
+3> sys:get_state(Conn).
+{unauthenticated,{data,#Port<0.7>,<<>>,undefined,[]}}
+4> timer:sleep(2100).
+ok
+5> ws_client:recv_frame(A).
+{close,<<3,240,108,111,103,105,110,32,116,105,109,101,
+         111,117,116>>}
+```
+
+The bytes `3,240` are close code 1008, policy violation. The process is gone.
+
+## When Not to Use It
+
+A gen_server with one boolean in its state is fine. `chat_room` and `chat_stats` handle every message the same way at all times, so states would add nothing. Reach for gen_statem when the same event needs different handling in different phases, when timers belong to phases, or when events must wait for a later phase. The port of `chat_connection` is about as long as the original. In return each state lists what it accepts and the login timeout costs two lines.
+
+## Exercises
+
+**Exercise 1: Three Strikes**
+
+Count failed logins in the data of `chat_session`. The third failure replies and stops the session.
+
+```erlang
+% Expected for the second and third wrong password:
+% chat_session:login(S, <<"alice">>, <<"b">>).  => {error,invalid_credentials}
+% chat_session:login(S, <<"alice">>, <<"c">>).  => {error,too_many_attempts}
+% is_process_alive(S).                          => false
+% {stop_and_reply, normal, [{reply, From, Reply}]} does both.
+```
+
+**Exercise 2: Idle Sessions**
+
+Move an authenticated session to `closing` when no `send` arrives for 60 seconds. Use the generic timeout `{{timeout, idle}, 60000, idle}` and start it again on every `send`. Then try the event timeout `{timeout, 60000, idle}` and find out why a `chat_event` breaks it.
+
+```erlang
+% Expected with a 500 ms idle time:
+% chat_session:login(S, <<"alice">>, <<"correct horse">>).
+% timer:sleep(600), sys:get_state(S).
+% => {closing,#{sent => 0,username => <<"alice">>}}
+```
+
+**Exercise 3: Finish the Port**
+
+Write the complete `chat_connection_fsm`. Turn the `handle_message/2` clauses into `unauthenticated/3` and `authenticated/3` clauses and make `handle_frame/2` return gen_statem tuples. Point `chat_conn_sup` and `chat_listener` at the new module and run the suite from lesson 24.
+
+```erlang
+% handle_frame({text, Text}, Data) returns these actions:
+% [{next_event, internal, {message, json:decode(Text)}},
+%  {next_event, internal, parse}]
+% Expected: rebar3 ct passes without changing the suite.
+```
+
+## Key Takeaways
+
+- **State and data are separate.** The state names the phase of the lifecycle. The data holds the rest
+- **`state_functions`** gives one function per atom state. **`handle_event_function`** gives one function and allows any term as state
+- **Actions** ride along with the return value. `{reply, From, Reply}` answers a call and `{next_event, internal, Event}` queues work for the machine
+- **`{state_timeout, Ms, Content}`** is cancelled when the state changes, so a login deadline needs no timer bookkeeping
+- **`postpone`** keeps an event until the next state change and then replays it
+- **Use gen_server** when every message is handled the same way at all times
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l37_callback_mode",
+      question: "Which callback mode calls one function per state, such as unauthenticated/3?",
+      code: "callback_mode() ->\n    ___.\n\ninit(Socket) ->\n    {ok, http, Socket}.\n\nhttp(cast, socket_ready, _Data) ->\n    keep_state_and_data.",
+      answer: "state_functions",
+      hint: "The other mode is handle_event_function.",
+      explanation: "With state_functions the state is an atom and gen_statem calls the function of that name."
+    },
+    {
+      id: "l37_reply_action",
+      question: "Which action answers the caller?",
+      code: "callback_mode() -> state_functions.\n\ninit([]) ->\n    {ok, unauthenticated, 0}.\n\nunauthenticated({call, From}, {send, _Text}, _Data) ->\n    {keep_state_and_data, [{___, From, {error, not_authenticated}}]}.\n\n{ok, Pid} = gen_statem:start_link(?MODULE, [], []).\ngen_statem:call(Pid, {send, <<\"hi\">>}).\n% => {error, not_authenticated}",
+      answer: "reply",
+      hint: "It is what the caller is waiting for.",
+      explanation: "A gen_statem replies through the action {reply, From, Reply}."
+    },
+    {
+      id: "l37_next_state",
+      question: "Which atom starts the return tuple that moves the machine to authenticated?",
+      code: "callback_mode() -> state_functions.\n\ninit([]) ->\n    {ok, unauthenticated, undefined}.\n\nunauthenticated({call, From}, {login, Name}, _Data) ->\n    {___, authenticated, Name, [{reply, From, ok}]}.\n\nauthenticated({call, From}, whoami, Name) ->\n    {keep_state_and_data, [{reply, From, Name}]}.\n\n{ok, Pid} = gen_statem:start_link(?MODULE, [], []).\ngen_statem:call(Pid, {login, <<\"alice\">>}).\ngen_statem:call(Pid, whoami).\n% => <<\"alice\">>",
+      answer: "next_state",
+      hint: "The tuple is {What, NewState, NewData, Actions}.",
+      explanation: "After {next_state, authenticated, ...} the next call goes to authenticated/3."
+    },
+    {
+      id: "l37_state_timeout_event",
+      question: "Which event type does the login timer deliver?",
+      code: "callback_mode() -> state_functions.\n\ninit([]) ->\n    {ok, unauthenticated, #{}, [{state_timeout, 20, login}]}.\n\nunauthenticated(___, login, _Data) ->\n    {stop, normal}.\n\n{ok, Pid} = gen_statem:start(?MODULE, [], []).\nRef = monitor(process, Pid).\nreceive {'DOWN', Ref, process, Pid, Reason} -> Reason after 1000 -> timeout end.\n% => normal",
+      answer: "state_timeout",
+      hint: "It has the same name as the action that started the timer.",
+      explanation: "{state_timeout, 20, login} delivers the event (state_timeout, login, Data) after 20 ms in the same state."
+    },
+    {
+      id: "l37_timeout_cancelled",
+      question: "The login arrives before the 30 ms timeout. Is the process alive after 80 ms?",
+      code: "callback_mode() -> state_functions.\n\ninit([]) ->\n    {ok, unauthenticated, #{}, [{state_timeout, 30, login}]}.\n\nunauthenticated(cast, login, Data) ->\n    {next_state, authenticated, Data};\nunauthenticated(state_timeout, login, _Data) ->\n    {stop, normal}.\n\nauthenticated(_Type, _Event, _Data) ->\n    keep_state_and_data.\n\n{ok, Pid} = gen_statem:start(?MODULE, [], []).\ngen_statem:cast(Pid, login).\ntimer:sleep(80).\nis_process_alive(Pid).\n% => ___",
+      answer: "true",
+      hint: "What happens to a state timeout when the state changes?",
+      explanation: "A state change cancels the state timeout, so the stop clause never runs."
+    },
+    {
+      id: "l37_postpone",
+      question: "Which action keeps the chat event until the state changes?",
+      code: "callback_mode() -> state_functions.\n\ninit(Owner) ->\n    {ok, unauthenticated, Owner}.\n\nunauthenticated(info, {chat_event, _Event}, _Owner) ->\n    {keep_state_and_data, [___]};\nunauthenticated(cast, login, Owner) ->\n    {next_state, authenticated, Owner}.\n\nauthenticated(info, {chat_event, Event}, Owner) ->\n    Owner ! {delivered, Event},\n    keep_state_and_data.\n\n{ok, Pid} = gen_statem:start_link(?MODULE, self(), []).\nPid ! {chat_event, hello}.\ngen_statem:cast(Pid, login).\nreceive {delivered, Event} -> Event after 1000 -> timeout end.\n% => hello",
+      answer: "postpone",
+      hint: "The event is put aside and replayed later.",
+      explanation: "A postponed event is retried after the next state change, where authenticated/3 can deliver it."
+    }
+  ]}
+/>

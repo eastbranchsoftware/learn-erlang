@@ -1,0 +1,385 @@
+---
+title: "Advanced Security"
+description: "Harden the edge of the chat server with TLS, input size limits, per-connection rate limiting and an Origin check"
+postNumber: 34
+publishDate: 2026-09-19T00:00:00Z
+tags: ["advanced", "security", "tls"]
+difficulty: "advanced"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+Lesson 33 kept connections alive during a deploy. Anyone on the internet can open one of those connections, and not everyone is friendly.
+
+## What Can Go Wrong
+
+Anyone on the network path can read `ws://` traffic, including the passwords from lesson 21. A client can declare a huge frame, or never finish its HTTP request, and make us buffer until memory runs out. A logged-in client can flood a room. A page on another site can open a WebSocket to our server from a visitor's browser, which is called cross-site WebSocket hijacking.
+
+## TLS
+
+TLS encrypts the byte stream. HTTP and WebSocket run inside it unchanged, as `https://` and `wss://`. OTP ships it as the `ssl` application, so add `ssl` to `applications` in `src/chat_server.app.src`.
+
+For development, one command creates a self-signed certificate and its private key. Keep `certs/` out of version control.
+
+```bash
+mkdir certs
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" \
+  -keyout certs/key.pem -out certs/cert.pem
+```
+
+The `ssl` API mirrors `gen_tcp`, except that accepting takes two steps. `ssl:transport_accept/1` accepts the TCP connection at once. `ssl:handshake/2` then exchanges keys, which takes several round trips and waits for the client each time.
+
+That wait must not happen in the acceptor. A client that connects and stays silent would block it until the timeout, and nobody else could connect meanwhile. So the acceptor does the fast step, and each connection process runs its own handshake.
+
+A small module hides the difference from `chat_connection`. A socket becomes `{gen_tcp, Socket}` or `{ssl, Socket}`.
+
+**Create `src/chat_transport.erl`:**
+
+```erlang
+-module(chat_transport).
+-export([listen/1, accept/1, handshake/1]).
+-export([send/2, setopts/2, close/1, controlling_process/2, peername/1]).
+
+-define(OPTIONS, [binary, {packet, raw}, {active, false}, {reuseaddr, true}]).
+
+listen(Port) ->
+    case application:get_env(chat_server, tls, false) of
+        false ->
+            wrap(gen_tcp, gen_tcp:listen(Port, ?OPTIONS));
+        true ->
+            {ok, CertFile} = application:get_env(chat_server, certfile),
+            {ok, KeyFile} = application:get_env(chat_server, keyfile),
+            TlsOptions = [{certfile, CertFile}, {keyfile, KeyFile},
+                          {versions, ['tlsv1.3', 'tlsv1.2']}],
+            wrap(ssl, ssl:listen(Port, TlsOptions ++ ?OPTIONS))
+    end.
+
+%% Fast. Safe to call in the acceptor.
+accept({gen_tcp, Listen}) -> wrap(gen_tcp, gen_tcp:accept(Listen));
+accept({ssl, Listen}) -> wrap(ssl, ssl:transport_accept(Listen)).
+
+%% Slow for TLS. Call it in the connection process.
+handshake({gen_tcp, _} = Socket) -> {ok, Socket};
+handshake({ssl, Socket}) -> wrap(ssl, ssl:handshake(Socket, 5000)).
+
+send({Mod, Socket}, Data) -> Mod:send(Socket, Data).
+
+setopts({gen_tcp, Socket}, Options) -> inet:setopts(Socket, Options);
+setopts({ssl, Socket}, Options) -> ssl:setopts(Socket, Options).
+
+close({Mod, Socket}) -> Mod:close(Socket).
+
+controlling_process({Mod, Socket}, Pid) -> Mod:controlling_process(Socket, Pid).
+
+peername({gen_tcp, Socket}) -> inet:peername(Socket);
+peername({ssl, Socket}) -> ssl:peername(Socket).
+
+wrap(Mod, {ok, Socket}) -> {ok, {Mod, Socket}};
+wrap(_Mod, {error, Reason}) -> {error, Reason}.
+```
+
+The `versions` option refuses TLS 1.1 and older.
+
+**Update `src/chat_listener.erl`.** In `init/1`, open the socket with `{ok, ListenSocket} = chat_transport:listen(Port)`. The acceptor changes the same way.
+
+```erlang
+%% In src/chat_listener.erl
+accept_loop(ListenSocket) ->
+    {ok, Socket} = chat_transport:accept(ListenSocket),
+    {ok, Pid} = chat_conn_sup:start_connection(Socket),
+    ok = chat_transport:controlling_process(Socket, Pid),
+    chat_connection:socket_ready(Pid),
+    accept_loop(ListenSocket).
+```
+
+**Update `src/chat_connection.erl`.** The handshake runs once the process owns the socket. An active `ssl` socket delivers `{ssl, Socket, Data}`, `{ssl_closed, Socket}` and `{ssl_error, Socket, Reason}`, so the socket clauses of `handle_info/2` accept both sets of tags.
+
+```erlang
+%% In src/chat_connection.erl
+handle_cast(socket_ready, #state{socket = Socket} = State) ->
+    case chat_transport:handshake(Socket) of
+        {ok, Ready} -> activate(State#state{socket = Ready});
+        {error, _Reason} -> {stop, normal, State}
+    end.
+
+handle_info({Tag, _Socket, Data}, #state{buffer = Buffer} = State)
+  when Tag =:= tcp; Tag =:= ssl ->
+    process(State#state{buffer = <<Buffer/binary, Data/binary>>});
+handle_info({Tag, _Socket}, State) when Tag =:= tcp_closed; Tag =:= ssl_closed ->
+    {stop, normal, State};
+handle_info({Tag, _Socket, _Reason}, State) when Tag =:= tcp_error; Tag =:= ssl_error ->
+    {stop, normal, State};
+```
+
+In the rest of the module, replace `gen_tcp:send`, `inet:setopts` and `gen_tcp:close` with their `chat_transport` versions. In `priv/index.html`, the client must use the scheme `wss` instead of `ws` when `location.protocol` is `https:`.
+
+Turn TLS on in the `chat_server` section of `config/sys.config` from lesson 25. We use port 8443 for TLS. Without the `tls` key the server speaks plain TCP as before.
+
+```erlang
+{chat_server, [
+    {port, 8443},
+    {tls, true},
+    {certfile, "certs/cert.pem"},
+    {keyfile, "certs/key.pem"},
+    {allowed_origins, [<<"https://localhost:8443">>]}
+]}
+```
+
+Start `rebar3 shell --config config/sys.config`. `-k` makes curl accept a self-signed certificate.
+
+```bash
+$ curl -k -s -i https://localhost:8443/ | head -1
+HTTP/1.1 200 OK
+$ echo | openssl s_client -connect localhost:8443 -brief
+CONNECTION ESTABLISHED
+Protocol version: TLSv1.3
+Peer certificate: CN=localhost
+```
+
+In a browser, `https://localhost:8443/` works over `wss://` once you accept the certificate warning.
+
+In production, use a real certificate, for example from `letsencrypt.org`. Terminating TLS at a reverse proxy or load balancer, with the node in plain mode behind it, is just as legitimate.
+
+## Input Limits
+
+The frame header declares the payload length before any payload arrives, so the decoder can refuse a frame after at most 10 bytes. `decode_frame/2` takes the limit. `decode_frame/1` stays for existing callers.
+
+**Update `src/chat_ws.erl`.** Export `decode_frame/2`. `decode_length` and `decode_payload` pass `Max` along as a fifth argument, and `decode_payload` gets a new first clause.
+
+```erlang
+%% In src/chat_ws.erl
+%% Any atom compares greater than any number, so infinity means no limit.
+decode_frame(Bin) ->
+    decode_frame(Bin, infinity).
+
+decode_frame(<<Fin:1, Rsv:3, Opcode:4, Mask:1, Len7:7, Rest/binary>>, Max) ->
+    case frame_type(Fin, Rsv, Opcode) of
+        {ok, Type} when Len7 > 125, Type =/= text, Type =/= binary ->
+            {error, control_frame_too_large};
+        {ok, Type} ->
+            decode_length(Type, Mask, Len7, Rest, Max);
+        {error, Reason} ->
+            {error, Reason}
+    end;
+decode_frame(Bin, _Max) when is_binary(Bin) ->
+    more.
+
+%% New first clause
+decode_payload(_Type, _Mask, Len, _Data, Max) when Len > Max ->
+    {error, too_large};
+```
+
+The RFC caps control frames at 125 bytes. In `chat_connection`, `process/1` passes the limit and answers `too_large` with close code 1009. The HTTP phase gets a bound too, because a client that never sends the blank line would grow the buffer forever.
+
+```erlang
+%% In src/chat_connection.erl, process/1
+%% http phase, above the existing more clause
+        more when byte_size(Buffer) > 8192 ->
+            respond(400, <<"text/plain">>, <<"Request too large\n">>, State);
+
+%% websocket phase
+    MaxFrame = application:get_env(chat_server, max_frame_size, 65536),
+    case chat_ws:decode_frame(Buffer, MaxFrame) of
+        {error, too_large} ->
+            send_frame({close, <<1009:16>>}, State),
+            {stop, normal, State};
+```
+
+## Rate Limiting
+
+A token bucket holds up to `capacity` tokens and gains `rate` tokens per second. Each message costs one token, so a user can send a short burst, but the average cannot exceed the rate. The bucket is plain data without a timer. Each `take` first adds the tokens earned since the last one.
+
+**Create `src/chat_rate.erl`:**
+
+```erlang
+-module(chat_rate).
+-export([new/2, take/1, take/2]).
+
+%% Tokens are floats, because a refill can add a fraction of a token.
+new(Capacity, Rate) ->
+    #{capacity => float(Capacity), rate => Rate, tokens => float(Capacity),
+      last => erlang:monotonic_time(millisecond)}.
+
+take(Bucket) ->
+    take(Bucket, erlang:monotonic_time(millisecond)).
+
+take(#{capacity := Capacity, rate := Rate, tokens := Tokens, last := Last} = Bucket, Now) ->
+    Refilled = min(Capacity, Tokens + (Now - Last) * Rate / 1000),
+    case Refilled >= 1 of
+        true -> {ok, Bucket#{tokens := Refilled - 1, last := Now}};
+        false -> {error, rate_limited}
+    end.
+```
+
+`erlang:monotonic_time/1` never jumps when the system clock is adjusted. `take/2` accepts the time as an argument, so we can try a bucket of two tokens with our own clock.
+
+```erlang
+1> B0 = (chat_rate:new(2, 1))#{last := 0}.
+#{last => 0,tokens => 2.0,capacity => 2.0,rate => 1}
+2> {ok, B1} = chat_rate:take(B0, 0).
+{ok,#{last => 0,tokens => 1.0,capacity => 2.0,rate => 1}}
+3> {ok, B2} = chat_rate:take(B1, 0).
+{ok,#{last => 0,tokens => 0.0,capacity => 2.0,rate => 1}}
+4> chat_rate:take(B2, 500).
+{error,rate_limited}
+5> chat_rate:take(B2, 1500).
+{ok,#{last => 1500,tokens => 0.5,capacity => 2.0,rate => 1}}
+```
+
+**Update `src/chat_connection.erl`.** The state record gains `bucket` and `strikes = 0`, and `init/1` sets `bucket = chat_rate:new(10, 2)`. The `message` clause of `handle_message/2` now takes a token first. Its old head and body move into `send_chat/2`, behind a new clause for the text limit.
+
+```erlang
+%% In src/chat_connection.erl
+handle_message(#{<<"type">> := <<"message">>} = Message,
+               #state{bucket = Bucket, strikes = Strikes} = State) ->
+    case chat_rate:take(Bucket) of
+        {ok, NewBucket} ->
+            send_chat(Message, State#state{bucket = NewBucket, strikes = 0});
+        {error, rate_limited} ->
+            send_error(rate_limited, State#state{strikes = Strikes + 1})
+    end;
+
+send_chat(#{<<"text">> := Text}, State)
+  when is_binary(Text), byte_size(Text) > 2000 ->
+    send_error(message_too_long, State);
+%% ... the old message clause, renamed to send_chat ...
+send_chat(_Message, State) ->
+    send_error(bad_message, State).
+```
+
+A client that ignores `rate_limited` collects strikes. The `text` clause of `handle_frame/2` checks them before it continues.
+
+```erlang
+%% In src/chat_connection.erl, the end of the {text, Text} clause
+    case NewState#state.strikes > 20 of
+        true ->
+            send_frame({close, <<1008:16>>}, NewState),
+            {stop, normal, NewState};
+        false ->
+            process(NewState)
+    end;
+```
+
+Code 1008 means policy violation. A Node 22 script that logs in over `wss://` and sends 100 messages at once gets 10 through, then 21 `rate_limited` errors, then the close frame.
+
+## The Origin Check
+
+Browsers do not apply the same-origin policy to WebSockets. They only report where the page came from in the `Origin` header, and the server must decide. We compare it with the `allowed_origins` list from app env and answer 403 otherwise.
+
+Other programs send no `Origin`, or any value they like. The check protects browser users, so requests without the header pass. The old body of the `/ws` clause moves into `upgrade/2`.
+
+```erlang
+%% In src/chat_connection.erl
+handle_request(#{method := 'GET', path := <<"/ws">>, headers := Headers} = Request, State) ->
+    case origin_allowed(Headers) of
+        true -> upgrade(Request, State);
+        false -> respond(403, <<"text/plain">>, <<"Origin not allowed\n">>, State)
+    end;
+
+origin_allowed(#{<<"origin">> := Origin}) ->
+    Default = [<<"http://localhost:8080">>],
+    lists:member(Origin, application:get_env(chat_server, allowed_origins, Default));
+origin_allowed(_Headers) ->
+    true.
+```
+
+A curl upgrade request with `-H "Origin: https://evil.example"` gets `HTTP/1.1 403 Forbidden`.
+
+Hijacking is worst with cookie sessions, because the browser attaches cookies to the upgrade request of a foreign page. Our token lives in `sessionStorage`, which a foreign page cannot read, so such a socket starts unauthenticated.
+
+Still out of scope are TLS between cluster nodes (`-proto_dist inet_tls`), secrets management and audit logging.
+
+## Exercises
+
+**Exercise 1: Limit login attempts**
+
+Each `login` costs 100000 PBKDF2 rounds (lesson 21), so the slow hash is also a lever for denial of service. Keep one `chat_rate` bucket per username in the `chat_auth` state and check it before hashing.
+
+```erlang
+% Bucket per username: chat_rate:new(5, 0.1)
+% Expected on the sixth quick attempt:
+% chat_auth:login(<<"alice">>, <<"guess">>).  => {error, too_many_attempts}
+```
+
+**Exercise 2: Connections per address**
+
+Use `chat_transport:peername/1` and refuse more than 20 open connections from one IP address.
+
+```erlang
+% chat_transport:peername(Socket).  => {ok, {{127,0,0,1}, 52144}}
+% Expected: connection 21 from one address is closed at once
+```
+
+**Exercise 3: Test the bucket**
+
+Write `test/chat_rate_tests.erl` with EUnit (lesson 23). With `take/2` no test has to sleep.
+
+```erlang
+% Cover: a burst of Capacity takes succeeds, the next take fails,
+% a long pause never refills past Capacity
+```
+
+## Key Takeaways
+
+- **TLS wraps the byte stream.** The protocol code above it does not change
+- **Accept is two steps.** `ssl:handshake/2` waits for the client, so it runs in the connection process with a timeout
+- **A transport wrapper** keeps one code path for both socket types. Active `ssl` sockets send `ssl`, `ssl_closed` and `ssl_error` messages
+- **Check sizes before buffering.** Refuse a frame by its header, bound the HTTP buffer, limit text with `byte_size/1`
+- **A token bucket** is a small map in the connection state. A pure function with an explicit clock is easy to test
+- **Check `Origin` on the upgrade.** Browsers report it but enforce nothing for WebSockets
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l34_handshake_step",
+      question: "Which ssl function completes the TLS handshake on a socket returned by transport_accept?",
+      code: "serve(ListenSocket) ->\n    {ok, Socket} = ssl:transport_accept(ListenSocket),\n    {ok, TlsSocket} = ssl:___(Socket, 5000),\n    ssl:send(TlsSocket, <<\"hello\">>).",
+      answer: "handshake",
+      hint: "It takes the socket and a timeout.",
+      explanation: "ssl:handshake/2 does the slow key exchange, so it belongs in the connection process, not in the acceptor."
+    },
+    {
+      id: "l34_ssl_message_tag",
+      question: "This function only knows the gen_tcp tags. What does it return for data from an active ssl socket?",
+      code: "event({tcp, _Socket, Data}) -> {data, Data};\nevent({tcp_closed, _Socket}) -> closed;\nevent(_Other) -> ignored.\n\nevent({tcp, port, <<\"hi\">>}).\n% => {data, <<\"hi\">>}\nevent({ssl, socket, <<\"hi\">>}).\n% => ___",
+      answer: "ignored",
+      hint: "An ssl socket uses the tags ssl, ssl_closed and ssl_error.",
+      explanation: "Only the catch-all clause matches. The connection needs clauses for both sets of tags."
+    },
+    {
+      id: "l34_origin_member",
+      question: "Which lists function checks the Origin header against the allow-list?",
+      code: "Allowed = [<<\"https://chat.example\">>, <<\"https://localhost:8443\">>].\nCheck = fun(Origin) -> lists:___(Origin, Allowed) end.\nCheck(<<\"https://chat.example\">>).\n% => true\nCheck(<<\"https://evil.example\">>).\n% => false",
+      answer: "member",
+      hint: "It returns true when the element is in the list.",
+      explanation: "The origin must match one entry exactly. Anything else gets a 403."
+    },
+    {
+      id: "l34_frame_header_check",
+      question: "The header declares a 100000 byte payload and no payload has arrived. Which reason does the check return?",
+      code: "check(<<_:9, 127:7, Len:64, _/binary>>, Max) when Len > Max -> {error, too_large};\ncheck(_Header, _Max) -> ok.\n\ncheck(<<1:1, 0:3, 1:4, 1:1, 127:7, 100000:64>>, 65536).\n% => {error, ___}",
+      answer: "too_large",
+      hint: "The 64-bit length field is part of the header.",
+      explanation: "The length is known after 10 bytes, so the payload is never buffered."
+    },
+    {
+      id: "l34_bucket_empty",
+      question: "The bucket holds one token and no time passes. Which reason does the second take return?",
+      code: "take(#{tokens := Tokens} = Bucket) when Tokens >= 1 ->\n    {ok, Bucket#{tokens := Tokens - 1}};\ntake(_Bucket) ->\n    {error, rate_limited}.\n\n{ok, Bucket} = take(#{tokens => 1}).\ntake(Bucket).\n% => {error, ___}",
+      answer: "rate_limited",
+      hint: "The first take spends the only token.",
+      explanation: "With zero tokens the guard fails. The connection answers with an error event and counts a strike."
+    },
+    {
+      id: "l34_bucket_refill_cap",
+      question: "The bucket holds 8 of 10 tokens and gains 2 per second. How many does it hold after a minute of silence?",
+      code: "refill(Tokens, Capacity, Rate, ElapsedMs) ->\n    min(Capacity, Tokens + ElapsedMs * Rate div 1000).\n\nrefill(0, 10, 2, 3000).\n% => 6\nrefill(8, 10, 2, 60000).\n% => ___",
+      answer: "10",
+      hint: "min/2 keeps the bucket from growing past its capacity.",
+      explanation: "A minute would add 120 tokens, but the bucket is capped. A quiet user cannot save up for a flood."
+    }
+  ]}
+/>

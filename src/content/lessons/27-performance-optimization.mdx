@@ -1,0 +1,412 @@
+---
+title: "Performance Optimization"
+description: "Measure the chat server, find the registry bottleneck, and remove it with an ETS table that every process can read"
+postNumber: 27
+publishDate: 2026-09-19T00:00:00Z
+tags: ["advanced", "performance", "ets"]
+difficulty: "advanced"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+The metrics from lesson 26 show when the server is busy. They do not show which code is responsible. Lesson 13 predicted that `chat_registry` would become a queue, because every lookup passes through one process. We'll measure that claim first, fix it with ETS, and then look at two smaller savings.
+
+## Measure First
+
+`timer:tc/3` runs a function and returns `{Microseconds, Result}`. `timer:tc/1` does the same for a fun.
+
+```erlang
+1> timer:tc(chat_registry, lookup, [<<"user_42">>]).
+{10,{ok,<0.139.0>}}
+2> timer:tc(chat_registry, lookup, [<<"user_42">>]).
+{6,{ok,<0.139.0>}}
+```
+
+A single run says little. The numbers jump around with scheduling and garbage collection, and one idle caller is not a load. Two rules make measurements useful. Run many iterations, and run them from a compiled module. Code typed into the shell is interpreted, which distorts the result. A loop of 100,000 lookups written as a shell fun took 162 ms here. The same loop in a module took 122 ms.
+
+The benchmark registers fake users, then starts a number of processes that all look up random names at the same time.
+
+**Create `src/chat_bench.erl`:**
+
+```erlang
+-module(chat_bench).
+-export([populate/1, lookups/2]).
+
+%% Register N fake users named user_1 .. user_N.
+populate(N) ->
+    [begin
+         Pid = spawn(fun() -> receive stop -> ok end end),
+         ok = chat_registry:register_user(name(I), Pid)
+     end || I <- lists:seq(1, N)],
+    ok.
+
+%% Procs processes, each doing PerProc lookups at the same time.
+lookups(Procs, PerProc) ->
+    Users = length(chat_registry:list_users()),
+    Parent = self(),
+    Worker = fun() ->
+        receive go -> ok end,
+        [{ok, _} = chat_registry:lookup(name(rand:uniform(Users)))
+         || _ <- lists:seq(1, PerProc)],
+        Parent ! {done, self()}
+    end,
+    Pids = [spawn_link(Worker) || _ <- lists:seq(1, Procs)],
+    {Micros, ok} = timer:tc(fun() ->
+        [Pid ! go || Pid <- Pids],
+        [receive {done, Pid} -> ok end || Pid <- Pids],
+        ok
+    end),
+    Total = Procs * PerProc,
+    #{lookups => Total,
+      millis => Micros div 1000,
+      per_second => Total * 1000000 div Micros}.
+
+name(I) ->
+    <<"user_", (integer_to_binary(I))/binary>>.
+```
+
+The workers wait for `go`, so spawning them is not part of the measured time. Here is the gen_server registry with 10,000 users on an 8-core laptop.
+
+```erlang
+1> chat_bench:populate(10000).
+ok
+2> chat_bench:lookups(1, 100000).
+#{lookups => 100000,millis => 118,per_second => 843276}
+3> chat_bench:lookups(8, 100000).
+#{lookups => 800000,millis => 1176,per_second => 680220}
+4> chat_bench:lookups(100, 10000).
+#{lookups => 1000000,millis => 1137,per_second => 879464}
+```
+
+One caller gets about 840,000 lookups per second. Eight callers on eight cores get fewer. A flat line like this is the signature of a serial bottleneck. Each lookup is a message to the registry and a reply back, and the registry handles one message at a time. Seven cores wait for the eighth.
+
+`broadcast/1` makes it worse, because it loops over all users inside that same process. `eprof` shows where the time goes. It traces the processes you name and reports time per function.
+
+```erlang
+5> eprof:start().
+{ok,<0.10099.0>}
+6> eprof:start_profiling([chat_registry]).
+profiling
+7> chat_registry:broadcast(#{type => system, text => <<"hello">>}).
+ok
+8> sys:get_state(chat_registry), ok.
+ok
+9> eprof:stop_profiling().
+profiling_stopped
+10> eprof:analyze(total).
+FUNCTION                              CALLS        %   TIME  [uS / CALLS]
+--------                              -----  -------   ----  [----------]
+maps:try_next/2                       10000     2.94    455  [      0.05]
+gen:reply/2                               1     3.25    502  [    502.00]
+maps:foreach_1/3                      10001     8.13   1258  [      0.13]
+chat_registry:'-send_all/2-fun-0-'/3  10000    83.96  12988  [      1.30]
+------------------------------------  -----  -------  -----  [----------]
+Total:                                30068  100.00%  15469  [      0.51]
+```
+
+The output is trimmed to the last rows. `broadcast/1` is a cast, so prompt 8 makes a call to wait until the registry has worked through it. The fun that sends to each pid takes 84% of the time. Tracing inflates the numbers, but without the profiler the broadcast still takes 12 ms, and every lookup in the system waits that long. `fprof` is the heavier alternative that also records who called whom.
+
+## ETS
+
+An ETS table is an in-memory store for tuples that lives outside any process heap. A process creates it and owns it. The table is destroyed when its owner exits. One element of each tuple is the key, the first by default. In a `set` table every key occurs once.
+
+```erlang
+1> T = ets:new(users, [set]).
+#Ref<0.1207811973.3318611973.79226>
+2> ets:insert(T, {<<"alice">>, online}).
+true
+3> ets:lookup(T, <<"alice">>).
+[{<<"alice">>,online}]
+4> ets:lookup(T, <<"bob">>).
+[]
+5> ets:insert_new(T, {<<"alice">>, away}).
+false
+6> ets:tab2list(T).
+[{<<"alice">>,online}]
+7> ets:delete(T, <<"alice">>).
+true
+```
+
+`ets:lookup/2` returns a list, because other table types allow several tuples per key. `ets:insert/2` overwrites an existing key. `ets:insert_new/2` refuses and returns `false`, which is "check, then insert" as one atomic step.
+
+Three options of `ets:new/2` matter for the registry.
+
+- `named_table` lets any process refer to the table by its name instead of the reference.
+- `protected` is the default access mode. Every process can read, only the owner can write. `public` and `private` are the alternatives.
+- `{read_concurrency, true}` tunes the table's locks for many simultaneous readers and few writers.
+
+Lookups need no message and no process switch. The caller reads the table on its own core while other callers do the same.
+
+## The New Registry
+
+The gen_server stays. It owns the table and performs every write, so registrations are still serialized and two people cannot get the same name. It also still holds the monitors. `lookup/1`, `list_users/0` and `broadcast/1` no longer send it anything. They run in the calling process and read the table. The client API is unchanged, so no caller needs an edit.
+
+**Update `src/chat_registry.erl`:**
+
+```erlang
+-module(chat_registry).
+-behaviour(gen_server).
+
+-export([start_link/0, register_user/2, unregister_user/1, lookup/1, list_users/0]).
+-export([broadcast/1]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+
+-define(TABLE, chat_registry).
+
+%%% Writes go through the server
+
+-spec start_link() -> {ok, pid()} | {error, term()}.
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+-spec register_user(binary(), pid()) -> ok | {error, username_taken}.
+register_user(Username, Pid) ->
+    gen_server:call(?MODULE, {register, Username, Pid}).
+
+-spec unregister_user(binary()) -> ok.
+unregister_user(Username) ->
+    gen_server:call(?MODULE, {unregister, Username}).
+
+%%% Reads run in the calling process
+
+-spec lookup(binary()) -> {ok, pid()} | {error, not_found}.
+lookup(Username) ->
+    case ets:lookup(?TABLE, Username) of
+        [{Username, Pid}] -> {ok, Pid};
+        [] -> {error, not_found}
+    end.
+
+-spec list_users() -> [binary()].
+list_users() ->
+    lists:sort([Name || {Name, _Pid} <- ets:tab2list(?TABLE)]).
+
+-spec broadcast(map()) -> ok.
+broadcast(Event) ->
+    ets:foldl(fun({_Name, Pid}, ok) -> Pid ! {chat_event, Event}, ok end, ok, ?TABLE).
+
+%%% Callbacks. The state maps a monitor reference to a username.
+
+init([]) ->
+    ?TABLE = ets:new(?TABLE, [set, named_table, protected, {read_concurrency, true}]),
+    {ok, #{}}.
+
+handle_call({register, Username, Pid}, _From, Refs) ->
+    case ets:insert_new(?TABLE, {Username, Pid}) of
+        true ->
+            Ref = monitor(process, Pid),
+            {reply, ok, Refs#{Ref => Username}};
+        false ->
+            {reply, {error, username_taken}, Refs}
+    end;
+handle_call({unregister, Username}, _From, Refs) ->
+    ets:delete(?TABLE, Username),
+    case [Ref || Ref := Name <- Refs, Name =:= Username] of
+        [Ref] ->
+            demonitor(Ref, [flush]),
+            {reply, ok, maps:remove(Ref, Refs)};
+        [] ->
+            {reply, ok, Refs}
+    end.
+
+handle_cast(_Msg, Refs) ->
+    {noreply, Refs}.
+
+handle_info({'DOWN', Ref, process, _Pid, _Reason}, Refs) ->
+    case maps:take(Ref, Refs) of
+        {Name, Rest} ->
+            ets:delete(?TABLE, Name),
+            broadcast(#{type => system, text => <<Name/binary, " disconnected">>}),
+            {noreply, Rest};
+        error ->
+            {noreply, Refs}
+    end;
+handle_info(_Msg, Refs) ->
+    {noreply, Refs}.
+```
+
+The table holds `{Username, Pid}` tuples. The state is now keyed by monitor reference, so the common `'DOWN'` path is one `maps:take/2`. The rare manual unregister scans the map with a map comprehension (`Key := Value <- Map`). `ets:foldl/3` visits every tuple without building a list of 10,000 entries first. The same benchmark again.
+
+```erlang
+1> chat_bench:populate(10000).
+ok
+2> chat_bench:lookups(1, 100000).
+#{lookups => 100000,millis => 18,per_second => 5465376}
+3> chat_bench:lookups(8, 100000).
+#{lookups => 800000,millis => 44,per_second => 18159119}
+4> chat_bench:lookups(100, 10000).
+#{lookups => 1000000,millis => 45,per_second => 21799315}
+```
+
+A single caller is six times faster because the round trip is gone. Eight callers reach 18 million lookups per second, 26 times the old figure, because the cores no longer wait for each other.
+
+## What It Costs
+
+**Reads can be stale.** A lookup used to queue behind the `'DOWN'` message of a dead user. Now it can run before the registry has handled that message and return a dead pid. A loop over lesson 23's `dead_user_is_removed/0` saw the dead user in 134 of 20,000 runs. Sending to a dead pid is harmless, so the server does not care. The test does. Make any call to the registry before the assertion. The call queues behind `'DOWN'`, so the cleanup is done when it returns.
+
+```erlang
+%% In test/chat_registry_tests.erl, dead_user_is_removed/0
+    _ = sys:get_state(chat_registry),
+    ?assertEqual({error, not_found}, chat_registry:lookup(<<"alice">>)).
+```
+
+With that line `rebar3 eunit` passes every time, and the other two tests pass unchanged.
+
+**The table dies with its owner.** If the registry crashes, the supervisor restarts it and `init/1` creates an empty table. Live connections are missing from it until they log in again. The map version lost its state the same way. Between crash and restart `ets:lookup/2` raises `badarg`, where the old version exited with `noproc`.
+
+**Reads copy.** ETS data lives outside the process heaps, so `ets:lookup/2` copies the tuple to the caller. For a name and a pid that is cheap. Large binaries are shared and not copied. Tables of big tuples that are read in bulk are a different story.
+
+## Smaller Savings
+
+**iolists.** `<<Header/binary, Payload/binary>>` allocates a new binary and copies the payload. `[Header, Payload]` is a two-element list that points at both. `gen_tcp:send/2` accepts either, which is why `chat_ws:encode_frame/1` and `json:encode/1` return iodata. Measured over 100,000 frames in a compiled module.
+
+| Payload | Concatenate | iolist |
+| --- | --- | --- |
+| 1,000 bytes | 8.8 ms | 0.4 ms |
+| 60,000 bytes | 96.3 ms | 0.5 ms |
+
+Never call `iolist_to_binary/1` on the way to a socket. A related saving is to encode a room message once instead of once per member. Measure before you bother. Encoding a short message 10,000 times took 4.2 ms here, spread over all connection processes. Exercise 3 builds it for the large rooms where it counts.
+
+**Hibernation.** Most connections are idle most of the time. A gen_server callback can return `{noreply, State, hibernate}`. The process then garbage collects, shrinks its heap to the minimum and sleeps until the next message. Doing that after every message wastes CPU on busy connections. The `hibernate_after` start option does it only after a quiet period.
+
+```erlang
+%% In src/chat_connection.erl
+start_link(Socket) ->
+    gen_server:start_link(?MODULE, Socket, [{hibernate_after, 5000}]).
+```
+
+`process_info/2` from lesson 26 shows the effect on a connection that logged in and sent 20 messages. The first result is right after the traffic, the second six seconds later.
+
+```erlang
+1> {ok, Conn} = chat_registry:lookup(<<"alice">>).
+{ok,<0.128.0>}
+2> process_info(Conn, memory).
+{memory,12112}
+3> process_info(Conn, memory).
+{memory,1656}
+```
+
+That is 10 KB per idle connection, or 1 GB for 100,000 of them. Without the option the process stayed at 13,984 bytes.
+
+## Exercises
+
+**Exercise 1: Count Without Copying**
+
+Add `chat_registry:count/0`. `ets:info(Table, size)` returns the number of tuples without reading them.
+
+```erlang
+% Expected:
+% chat_bench:populate(500).
+% chat_registry:count().  => 500
+```
+
+**Exercise 2: Benchmark the Broadcast**
+
+Add `chat_bench:broadcast/1`, which broadcasts N events from the calling process and returns the total time in milliseconds. While it runs, call `chat_bench:lookups(8, 100000)` from a second process. Compare both registry versions.
+
+```erlang
+% Expected with the ETS registry: lookup throughput barely changes
+% chat_bench:broadcast(100).
+```
+
+**Exercise 3: Encode Once**
+
+In `chat_room`, encode the frame once with `chat_ws:encode_frame({text, json:encode(Event)})` and send `{chat_frame, Frame}` to the members. Add a `handle_info/2` clause to `chat_connection` that passes the iodata to `gen_tcp:send/2`. History must still hold the event maps.
+
+```erlang
+%% In src/chat_connection.erl
+handle_info({chat_frame, Frame}, State) ->
+    % send Frame on the socket
+    {noreply, State};
+```
+
+**Exercise 4: Reverse Lookup**
+
+Add `whois(Pid)`, which returns `{ok, Username}` or `{error, not_found}`. Use `ets:match/2` with the pattern `{'$1', Pid}`. It scans the whole table. Decide what a second table keyed by pid would cost on the write path.
+
+```erlang
+% Expected:
+% chat_registry:register_user(<<"alice">>, self()).
+% chat_registry:whois(self()).  => {ok,<<"alice">>}
+```
+
+## Key Takeaways
+
+- **Measure before changing code.** Use `timer:tc` over many iterations in a compiled module, never a single run in the shell
+- **Flat throughput under more callers** means a serial bottleneck, usually one process that everyone calls
+- **`eprof`** profiles chosen processes and reports time per function
+- **ETS tables** hold tuples outside process heaps, belong to one process and vanish when it exits
+- **`protected` plus `read_concurrency`** gives one writer and many parallel readers, which suits a registry
+- **Keep writes in the owner process** so check-then-insert stays serialized. `ets:insert_new/2` does it in one step
+- **Direct reads can be stale** for a moment, so make sure every reader tolerates that
+- **iolists and `hibernate_after`** save copying and idle memory with one-line changes
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l27_tc_result",
+      question: "timer:tc/1 returns the elapsed microseconds and the fun's result. What is Result?",
+      code: "{Micros, Result} = timer:tc(fun() -> lists:sum([1, 2, 3]) end).\nis_integer(Micros).\n% => true\nResult.\n% => ___",
+      answer: "6",
+      hint: "The second element is whatever the fun returned.",
+      explanation: "timer:tc returns {Microseconds, Result}. The time varies between runs, and the result is the sum 6."
+    },
+    {
+      id: "l27_lookup_missing_key",
+      question: "What does ets:lookup/2 return for a key that is not in the table?",
+      code: "T = ets:new(users, [set]).\nets:insert(T, {<<\"alice\">>, online}).\n% => true\nets:lookup(T, <<\"bob\">>).\n% => ___",
+      answer: "[]",
+      hint: "lookup always returns a list of matching tuples.",
+      explanation: "ets:lookup/2 returns a list because bag tables can hold several tuples per key. No match gives the empty list."
+    },
+    {
+      id: "l27_insert_new_taken",
+      question: "What does ets:insert_new/2 return when the key already exists?",
+      code: "T = ets:new(users, [set]).\nets:insert_new(T, {<<\"alice\">>, first}).\n% => true\nets:insert_new(T, {<<\"alice\">>, second}).\n% => ___",
+      answer: "false",
+      hint: "It refuses to overwrite.",
+      explanation: "insert_new/2 checks and inserts in one atomic step. The registry turns false into {error, username_taken}."
+    },
+    {
+      id: "l27_access_mode",
+      question: "Which access mode lets every process read the table but only the owner write to it?",
+      code: "init([]) ->\n    ets:new(chat_registry, [set, named_table, ___, {read_concurrency, true}]),\n    {ok, #{}}.",
+      answer: "protected",
+      hint: "It is the default, between public and private.",
+      explanation: "A protected table has one writer, its owner, and any number of readers. That keeps registration serialized in the gen_server."
+    },
+    {
+      id: "l27_set_overwrites",
+      question: "A set table holds one tuple per key. What does the lookup return after two inserts?",
+      code: "T = ets:new(users, [set]).\nets:insert(T, {<<\"alice\">>, online}).\nets:insert(T, {<<\"alice\">>, away}).\nets:info(T, size).\n% => 1\nets:lookup(T, <<\"alice\">>).\n% => [{<<\"alice\">>, ___}]",
+      answer: "away",
+      hint: "ets:insert/2 does not refuse an existing key.",
+      explanation: "insert/2 replaces the tuple with the same key, so the table still has one entry and it holds the newer value."
+    },
+    {
+      id: "l27_hibernate_return",
+      question: "Which atom makes the gen_server shrink its heap and sleep until the next message?",
+      code: "handle_info(timeout, State) ->\n    {noreply, State, ___}.",
+      answer: "hibernate",
+      hint: "Animals do it in winter.",
+      explanation: "Returning hibernate as the third element garbage collects the process and drops its heap to the minimum until a message arrives."
+    },
+    {
+      id: "l27_protected_write",
+      question: "Another process tries to write to a protected table. Which error reason does it get?",
+      code: "T = ets:new(users, [set, protected]).\nParent = self().\nspawn(fun() ->\n    Result = try ets:insert(T, {<<\"mallory\">>, online})\n             catch error:Reason -> Reason end,\n    Parent ! {result, Result}\nend).\nreceive {result, R} -> R after 1000 -> timeout end.\n% => ___",
+      answer: "badarg",
+      hint: "ETS reports almost every problem with the same error.",
+      explanation: "Only the owner may write to a protected table. Any other process gets a badarg error, the same error as for a table that does not exist."
+    },
+    {
+      id: "l27_table_dies_with_owner",
+      question: "The owner of the table exits. What does ets:info/1 return for the table afterwards?",
+      code: "Parent = self().\n{Owner, Ref} = spawn_monitor(fun() ->\n    Parent ! {table, ets:new(users, [set, public])},\n    receive stop -> ok end\nend).\nT = receive {table, Table} -> Table after 1000 -> timeout end.\nets:insert(T, {<<\"alice\">>, online}).\n% => true\nOwner ! stop.\nreceive {'DOWN', Ref, process, Owner, normal} -> ok after 1000 -> timeout end.\n% => ok\nets:info(T).\n% => ___",
+      answer: "undefined",
+      hint: "The table no longer exists.",
+      explanation: "An ETS table is destroyed when its owner exits. ets:info/1 returns undefined for a missing table, while lookups raise badarg."
+    }
+  ]}
+/>
