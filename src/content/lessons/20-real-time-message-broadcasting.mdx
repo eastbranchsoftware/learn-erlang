@@ -205,9 +205,7 @@ The sender's own messages take the same route. The connection does not echo them
 
 ## Two Tabs
 
-Restart `rebar3 shell` and open `http://localhost:8080/` in two tabs. Join as `alice` in one and `bob` in the other. Both tabs show `bob joined`, and every message appears in both. Pick `alice` a second time in a third tab and it shows `error: username_taken`. Reload the page to try another name. Close Bob's tab and Alice sees `bob disconnected`.
-
-The shell sees the same picture, and it can take part.
+Restart `rebar3 shell` and open `http://localhost:8080/` in two tabs. Join as `alice` in one and `bob` in the other. Both tabs show `bob joined`, and every message appears in both. Send one message from each. The shell sees the same picture, and it can take part.
 
 ```erlang
 1> chat_registry:list_users().
@@ -218,7 +216,7 @@ The shell sees the same picture, and it can take part.
 ok
 ```
 
-Kill a connection with `exit(Pid, kill)`, using the pid from `chat_registry:lookup(<<"bob">>)`. The others read `bob disconnected` and keep chatting.
+Pick `alice` again in a third tab and it shows `error: username_taken`. Reload the page to try another name. Close Bob's tab and Alice sees `bob disconnected`. The same happens after `exit(Pid, kill)` with the pid from `chat_registry:lookup(<<"bob">>)`, and the others keep chatting.
 
 ## Exercises
 

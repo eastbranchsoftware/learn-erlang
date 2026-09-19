@@ -327,6 +327,14 @@ nc localhost 8080
       explanation: "simple_one_for_one starts with no children. Each supervisor:start_child/2 call creates one more from the single child spec."
     },
     {
+      id: "l19_connection_restart_type",
+      question: "Which restart type fits a process whose socket dies with it?",
+      code: "init([]) ->\n    Child = #{\n        id => chat_connection,\n        start => {chat_connection, start_link, []},\n        restart => ___\n    },\n    {ok, {#{strategy => simple_one_for_one}, [Child]}}.",
+      answer: "temporary",
+      hint: "The child is never restarted, whatever the exit reason.",
+      explanation: "A restarted connection would have no socket. The client reconnects and gets a new process."
+    },
+    {
       id: "l19_children_on_demand",
       question: "How many children are active after three start_child calls?",
       code: "start_conn(_Id) ->\n    {ok, spawn_link(fun() -> receive stop -> ok end end)}.\n\ninit([]) ->\n    Child = #{id => conn, start => {?MODULE, start_conn, []}, restart => temporary},\n    {ok, {#{strategy => simple_one_for_one}, [Child]}}.\n\n{ok, Sup} = supervisor:start_link(?MODULE, []).\nproplists:get_value(active, supervisor:count_children(Sup)).\n% => 0\n[supervisor:start_child(Sup, [Id]) || Id <- [1, 2, 3]].\nproplists:get_value(active, supervisor:count_children(Sup)).\n% => ___",
