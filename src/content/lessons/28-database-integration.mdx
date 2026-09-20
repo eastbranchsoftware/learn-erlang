@@ -159,7 +159,7 @@ init(Name) ->
     {ok, #{name => Name, members => #{}, history => History}}.
 ```
 
-In the `{message, Sender, Text}` clause, add `ok = chat_store:save_message(Name, Sender, Text),` on the line before `notify(Event, State)`.
+In the `{message, Sender, Text}` clause, add `ok = chat_store:save_message(Name, Sender, Text),` on the line before `notify(Event, State)`. Only the `History` line is new in `init/1`, so keep anything else you already have there, such as the `room_created` log from lesson 26.
 
 `chat_auth` drops the `users` map. Sessions stay in its state. A lost session costs the user one login, which is not worth a disk write per token.
 

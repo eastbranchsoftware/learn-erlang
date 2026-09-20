@@ -156,6 +156,8 @@ The connection has the states `http`, `unauthenticated` and `authenticated`. The
 ```erlang
 %% In src/chat_connection_fsm.erl
 -record(data, {socket, buffer = <<>>, username, rooms = []}).
+%% Lesson 34 adds bucket and strikes here, and routes socket calls
+%% through chat_transport, so {ssl, ...} arrives alongside {tcp, ...}.
 
 -define(LOGIN_TIMEOUT, 30000).
 

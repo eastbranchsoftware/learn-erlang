@@ -1,0 +1,207 @@
+---
+title: "The Final Project and Where to Go Next"
+description: "The whole chat server on one page, one message traced through every process, a production checklist, and the parts worth building next"
+postNumber: 40
+publishDate: 2026-09-19T00:00:00Z
+tags: ["advanced", "project", "architecture"]
+difficulty: "advanced"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+Lesson 00 promised a WebSocket chat server in pure Erlang, no dependencies, able to hold thousands of connections. That server exists. It serves HTTP and WebSocket on one port, authenticates users, keeps rooms with history in Mnesia, spans a cluster, and ships as a release with tests and a JSON API.
+
+## The Whole System on One Page
+
+`chat_server_app:start/2` runs `chat_store:init/0` to create the Mnesia schema and tables, then starts the top supervisor. Children start top to bottom, stop in reverse, and are `permanent` workers except where marked.
+
+```text
+chat_server_sup   one_for_one, intensity 5, period 10
+  chat_stats
+  chat_events
+  chat_events_guard
+  chat_registry
+  chat_auth
+  pg_chat             pg scope chat, lesson 31
+  chat_room_sup       simple_one_for_one
+    chat_room         temporary, one per room
+  chat_rooms
+  chat_conn_sup       simple_one_for_one
+    chat_connection   temporary, one per client
+  chat_listener
+  chat_metrics
+  chat_partition
+  chat_cluster
+```
+
+The two `simple_one_for_one` supervisors set `shutdown => infinity`, and their children are `temporary`: a restarted connection would have no socket. Order is dependency order. `pg_chat` precedes the rooms because `chat_room:init/1` joins the scope, `chat_room_sup` precedes `chat_rooms` because the manager terminates leftover rooms at startup, and the listener follows everything a new client touches.
+
+Every module, with the lessons that shaped it.
+
+- `chat_server_app`, `chat_server_sup` (00, 14, 28). Start the store, then the tree
+- `chat_stats` (12, 33). Counters, plus `code_change/3` and a versioned state
+- `chat_registry` (13, 20, 27). Online users. `broadcast/1` and `lookup/1` read ETS in the caller
+- `chat_auth` (21, 28, 32). `register/2`, `login/2`, `verify/1`, `logout/1`, with users and sessions in Mnesia
+- `chat_http`, `chat_ws` (16 to 18, 34, 39). Pure parsing. `parse_request/1`, `body/2`, `decode_frame/2`, `encode_frame/1`
+- `chat_listener`, `chat_conn_sup` (19, 25, 35, 36). Listen socket and acceptors, one child per socket
+- `chat_connection` (19 to 22, 26, 27, 34, 39). One gen_server per client. Buffer, phase, protocol, limits
+- `chat_transport`, `chat_rate` (34). `gen_tcp` and `ssl` behind one API. Token bucket
+- `chat_room_sup`, `chat_rooms` (22, 39). `start_room/1`, `ensure_room/1`, `list_rooms/0`
+- `chat_room` (22, 28, 31, 38, 39). Members, history, Mnesia writes, `pg` forwarding, event notification
+- `chat_store` (28, 32). Mnesia tables `chat_message`, `chat_user`, `chat_session`, replicated
+- `chat_metrics`, `chat_bench`, `chat_load` (26, 27, 35). `snapshot/0` for `/health`, timing and load
+- `chat_events` and its handlers (38, 39). Manager plus log, stats, moderation and webhook handlers
+- `chat_api` (39). `segments/1` and the JSON route table
+- `chat_cluster`, `chat_discovery`, `chat_partition` (30, 32). Connect nodes, find peers, watch Mnesia
+
+`test/` holds `chat_ws_tests`, `chat_http_tests`, `chat_registry_tests`, `chat_api_tests` and `chat_SUITE` with its `ws_client` helper. `applications` in `chat_server.app.src` ends at `[kernel, stdlib, crypto, mnesia, ssl, inets]`. `my_server`, `kv_store`, `echo_server`, `relay`, `greeter` and `chat_session` only ever taught.
+
+## One Message, End to End
+
+Alice types `hi` in the `erlang` room and her browser runs `ws.send(JSON.stringify(msg))`.
+
+1. The browser masks the frame with a random 4-byte key and writes the bytes, which cross the network as TCP segments.
+2. Her socket is in `{active, once}` mode and owned by her `chat_connection`, so the bytes arrive as one `{tcp, Socket, Data}` message (or `{ssl, ...}` after lesson 34) in `handle_info/2`, which appends them to `State#state.buffer` and calls `process/1`.
+3. `process/1` calls `chat_ws:decode_frame(Buffer, MaxFrame)`. Bit syntax reads the FIN bit, opcode, mask bit and the 7, 16 or 64 bit length, and `mask/2` XORs the payload with the key. A partial frame returns `more`, so `activate/1` re-arms the socket. A complete one returns `{ok, {text, Payload}, Rest}`, and `Rest` stays in the buffer, because one segment can hold several frames.
+4. `handle_frame({text, Text}, State)` runs `json:decode(Text)` inside `try ... of`, giving a map with binary keys.
+5. `handle_message/2` picks the clause matching `#{<<"type">> := <<"message">>, <<"room">> := Room, <<"text">> := Text}`. The gate clause above it answers `not_authenticated` while `username` is `undefined`. `chat_rate:take/1` spends a token, and text over 2000 bytes is refused.
+6. `chat_room:send_message(Room, Name, Text)` resolves the name through `chat_rooms:ensure_room(Room)`, then does `gen_server:call(Pid, {message, Name, Text})`.
+7. The room's `handle_call/3` clause checks `maps:is_key(Sender, Members)` and answers `{error, not_member}` to outsiders. It builds `Event = #{type => message, room => Name, from => Sender, text => Text}`, persists it with `chat_store:save_message/3`, calls `chat_events:notify/1`, and trims history with `lists:sublist([Event | History], 50)`.
+8. Delivery is local first. `notify/2` runs `maps:foreach` over the members, sending `{chat_event, Event}` to each pid. Then `pg:get_members(chat, {room, Name})` minus `pg:get_local_members/2` gives the same room on every other node, and each gets `{remote_message, Event}`. Those rooms deliver locally and stop, because forwarding again would send the message round the cluster forever.
+9. `gen_event:notify/2` walks the handlers in turn. `chat_stats_handler` bumps a counter, `chat_log_handler` writes a `logger` report, `chat_moderation_handler` checks the words, `chat_webhook_handler` posts out.
+10. Every member's `chat_connection` gets `{chat_event, Event}` in `handle_info/2`. `send_event/2` calls `json:encode(Event)`, which turns atom keys into JSON strings and returns iodata. `send_frame/2` calls `chat_ws:encode_frame({text, Json})` for an unmasked server frame, and `chat_transport:send/2` writes it.
+11. Each browser fires `ws.onmessage`, and `handle/1` appends a line with `textContent`.
+
+Alice's own connection takes step 10 like everyone else, so every client sees one order.
+
+## What Makes It Fault Tolerant
+
+Processes share no memory, so a crash destroys only what one process holds. A dying `chat_connection` takes one socket with it, and `chat_conn_sup` logs it and lets it go. Monitors in `chat_registry` and in every `chat_room` turn that exit into a `'DOWN'` message, and the user leaves the member lists with no cleanup code anywhere. A crashed room loses its members and history, but `chat_rooms` sees the `'DOWN'`, the next `ensure_room/1` starts a fresh one, and `chat_store:recent_messages/2` reloads it.
+
+Links go the other way. `chat_listener` links its acceptor and does not trap exits, so neither outlives the other. When a node dies, `pg` drops its rooms from every group and clients reconnect with the token from lesson 21. None of this needed a `try`. It needed somebody watching.
+
+## Production Checklist
+
+- TLS, frame and message limits, rate limiting, lesson 34. `ws://` leaks tokens
+- Accounts, token expiry, a gate clause every message passes, lesson 21
+- A release with `config/sys.config` and `vm.args`, lesson 25. No hard-coded ports
+- `logger` reports, `chat_metrics:snapshot/0`, alerts on queue length, process count, memory, lesson 26
+- A `/health` endpoint and shutdown that drains connections, lesson 36
+- `rebar3 eunit`, `rebar3 ct` and `dialyzer` in CI, lessons 23, 24, 36
+- Mnesia directory backups and a replica on a second node, lessons 28, 32
+- Cookie hygiene, lesson 29. The cookie is full access to the VM
+- VM and OS limits raised before the load arrives, lesson 35
+
+## What Is Deliberately Missing
+
+- **Delivery receipts.** Give each `chat_room` event an id, add an ack type to `chat_connection`, track unacked ids.
+- **Direct messages.** Lesson 20 left this as an exercise. `global:whereis_name({user, Name})` from lesson 31 finds a connection on any node.
+- **Presence and typing.** High volume, worthless a second later. Route them through `chat_events` and `pg`, never into Mnesia.
+- **File uploads.** `chat_http:body/2` reads a bounded body. Megabytes do not belong in a process state.
+- **Moderation.** The lesson 38 handler flags words. Bans and an audit trail need `chat_store` tables.
+- **A real database.** A million messages want Postgres behind the `chat_store` API, changing nothing else.
+- **Scaling past a full mesh.** Distributed Erlang connects every node to every other. Past roughly 100 nodes, use hidden nodes or a broker.
+- **An admin UI.** `chat_api` already returns rooms and messages.
+
+## Where to Go Next
+
+**Cowboy and Ranch.** Ranch is the acceptor pool of lessons 19 and 35, written by people who profiled it. Cowboy is `chat_http` and `chat_ws` with the parts we skipped, including fragmentation, HTTP/2 and compression. Read the source and you will recognise it.
+
+**Elixir and Phoenix.** Same VM, same processes and supervisors. Channels are `chat_room` and `pg`, and LiveView keeps a stateful process per browser tab, obvious once you know OTP and baffling before. **Nerves** puts these trees on embedded hardware, where a restart beats a reboot.
+
+**RabbitMQ and Riak** have public source worth reading. RabbitMQ shows flow control at scale, Riak shows consistent hashing and conflict resolution, where lesson 32 stopped.
+
+**PropEr** generates inputs instead of listing them. Point it at `chat_ws:encode_frame/1` composed with `decode_frame/1` and it finds what lesson 23 missed. **Dialyzer** is the other half. Add `-spec` lines and run it until quiet, and it reports unreachable clauses and impossible return values.
+
+**Books and docs.** *Learn You Some Erlang for Great Good!* is free online, and *Designing for Scalability with Erlang/OTP* covers releases and clustering properly. The OTP Design Principles guide at erlang.org/doc answers most questions faster than a search engine. All of these are pointers, not benchmarked endorsements.
+
+## Exercises
+
+**Exercise 1: Typing indicators across the cluster**
+
+Add `{"type":"typing","room":"erlang"}`. The room forwards a `typing` event to its other local members and, through `pg`, to peer rooms, leaving history alone.
+
+```erlang
+% Expected, and nothing in recent_messages/2:
+% #{type => typing, room => <<"erlang">>, from => <<"alice">>}
+```
+
+**Exercise 2: Direct messages with offline delivery**
+
+Add `{"type":"direct","to":"bob","text":"psst"}`. Deliver it live when `global:whereis_name({user, Name})` finds a connection, otherwise store it in a new Mnesia table and deliver it on the next login.
+
+```erlang
+% Expected: bob logs in later and receives it
+```
+
+**Exercise 3: Swap the store backend**
+
+Keep the `chat_store` API and write a second module that talks to a database over TCP, picked by an app env key. Nothing else may change.
+
+```erlang
+% Expected: rebar3 ct passes with either backend configured
+```
+
+## Key Takeaways
+
+- **The tree is the architecture.** Start order is dependency order, a child's restart type says what happens when it fails, and one process covers each thing that fails alone
+- **Messages are the only coupling.** `{chat_event, Event}` and `{remote_message, Event}` are the seams, so a room can move nodes unnoticed
+- **Monitors clean up state, links share fate.** Neither needs the failing process to cooperate
+- **Pure functions at the edges.** `chat_ws` and `chat_http` hold no state, so they were easiest to test
+- **Durable data lives outside processes.** What a process holds dies with it, by design
+- **Everything here is stdlib.** `gen_server`, `supervisor`, `gen_event`, `ets`, `mnesia`, `pg`, `ssl`, `logger`, `json` and `crypto`
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l40_event_tag",
+      question: "Which tag does chat_room use when it sends an event to a member?",
+      code: "Event = #{type => message, room => <<\"erlang\">>, text => <<\"hi\">>}.\nself() ! {___, Event}.\nreceive {chat_event, #{text := Text}} -> Text after 1000 -> timeout end.\n% => <<\"hi\">>",
+      answer: "chat_event",
+      hint: "chat_connection matches this tuple in handle_info/2.",
+      explanation: "Every fan-out ends with Pid ! {chat_event, Event}, which becomes one text frame."
+    },
+    {
+      id: "l40_selective_receive",
+      question: "The spawned process waits for a different pattern. What does this receive return?",
+      code: "Pid = spawn(fun() ->\n    receive {ping, From} -> From ! pong end\nend).\nPid ! {pong, self()}.\nreceive pong -> pong after 200 -> timeout end.\n% => ___",
+      answer: "timeout",
+      hint: "The tuple sent does not match the receive pattern.",
+      explanation: "A receive scans the mailbox for a match. Without the after clause this waits forever."
+    },
+    {
+      id: "l40_top_strategy",
+      question: "Which strategy lets one child crash while the others keep running?",
+      code: "init([]) ->\n    SupFlags = #{strategy => ___, intensity => 5, period => 10},\n    Children = [#{id => chat_stats, start => {chat_stats, start_link, []}}],\n    {ok, {SupFlags, Children}}.",
+      answer: "one_for_one",
+      hint: "Only the failed child is restarted.",
+      explanation: "The children are independent, so a crashed chat_stats never disturbs the open connections."
+    },
+    {
+      id: "l40_monitor_reason",
+      question: "What exit reason does the DOWN message carry?",
+      code: "{_Pid, Ref} = spawn_monitor(fun() -> exit(room_gone) end).\nreceive {'DOWN', Ref, process, _Who, Reason} -> Reason after 1000 -> timeout end.\n% => ___",
+      answer: "room_gone",
+      hint: "The monitoring process is told, not killed.",
+      explanation: "A monitor sends a message instead of an exit signal, so chat_rooms survives a room crash."
+    },
+    {
+      id: "l40_frame_opcode",
+      question: "Which opcode does chat_ws read out of this text frame header?",
+      code: "<<Fin:1, 0:3, Opcode:4, Masked:1, Length:7>> = <<129, 131>>.\n{Fin, Opcode, Masked, Length}.\n% => {1, ___, 1, 3}",
+      answer: "1",
+      hint: "The first byte 129 is 1000 0001 in binary.",
+      explanation: "Bit syntax splits both header bytes in one match. Opcode 1 is text, 8 close, 9 ping, 10 pong."
+    },
+    {
+      id: "l40_member_names",
+      question: "Which name completes the sorted member list?",
+      code: "Members = #{<<\"alice\">> => p1, <<\"bob\">> => p2, <<\"carol\">> => p3}.\nlists:sort([Name || {Name, _Pid} <- maps:to_list(Members)]).\n% => [<<\"alice\">>, <<\"bob\">>, ___]",
+      answer: "<<\"carol\">>",
+      hint: "Binaries sort by their bytes.",
+      explanation: "chat_room:members/1 does the same with maps:keys/1. Names are binaries throughout."
+    }
+  ]}
+/>

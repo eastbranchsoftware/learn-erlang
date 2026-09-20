@@ -13,7 +13,7 @@ Lesson 38 let code inside the VM subscribe to chat events. A deploy script or a 
 
 ## Reading a Request Body
 
-`chat_http:parse_request/1` from lesson 16 stops at the end of the headers. A POST carries a body after them, and the `content-length` header says how many bytes it has. TCP ignores that boundary. The headers can arrive with half of the body, or with none of it.
+`chat_http:parse_request/1` from lesson 16 stops at the end of the headers. A POST carries a body after them, and `content-length` says how many bytes it has. TCP ignores that boundary, so the headers can arrive with half of the body, or none of it.
 
 **Update `src/chat_http.erl`:**
 
@@ -45,7 +45,7 @@ reason(411) -> <<"Length Required">>;
 reason(413) -> <<"Payload Too Large">>;
 ```
 
-The 413 check comes before the size check, so a client that announces 2 GB gets its answer at once and we never buffer more than 64 KB. A POST without `content-length` gets 411, which also covers chunked uploads. A GET gets an empty body.
+The 413 check comes before the size check, so a client announcing 2 GB gets its answer at once and we never buffer more than 64 KB. A POST without `content-length` gets 411, which also covers chunked uploads. A GET gets an empty body.
 
 **Update `src/chat_connection.erl`:**
 
@@ -64,11 +64,11 @@ The 413 check comes before the size check, so a client that announces 2 GB gets 
             end;
 ```
 
-This `more` keeps the whole buffer, headers included, and the phase stays `http`. The next `{tcp, ...}` message appends to it and `process/1` parses again from the start. Parsing headers twice is cheap, and the state needs no new field.
+This `more` keeps the whole buffer, headers included, and the phase stays `http`. The next `{tcp, ...}` message appends to it and `process/1` parses again from the start. Parsing headers twice is cheap and the state needs no new field.
 
 ## Routing Is Pattern Matching
 
-A path like `/api/rooms/erlang/messages?limit=5` becomes the list `[<<"api">>, <<"rooms">>, <<"erlang">>, <<"messages">>]`. Cut the query string off, then split on the slash. `trim_all` drops the empty binary before the leading slash, and one after a trailing slash.
+A path like `/api/rooms/erlang/messages?limit=5` becomes `[<<"api">>, <<"rooms">>, <<"erlang">>, <<"messages">>]`. Cut the query string off, then split on the slash. `trim_all` drops the empty binary before the leading slash, and one after a trailing slash.
 
 The router is a function whose clauses match on the method and that list. A variable in the list is a path parameter.
 
@@ -140,22 +140,23 @@ authenticate(_Req) ->
 
 `handle/4` returns a status and a term and never touches a socket, so the caller encodes every result as JSON in one place. A known path with the wrong method falls through to a 405 clause, anything else to 404.
 
-Every call needs `Authorization: Bearer TOKEN`. One binary pattern checks the scheme and extracts the token. `crypto:hash_equals/2` compares in constant time as in lesson 21, so response time does not reveal how many leading bytes were right. It raises `badarg` for binaries of different sizes, so the length check runs first. Tokens map to bot names in the application environment.
+Every call needs `Authorization: Bearer TOKEN`, and one binary pattern checks the scheme and extracts the token. `crypto:hash_equals/2` compares in constant time as in lesson 21, so response time does not reveal how many leading bytes were right. It raises `badarg` for binaries of different sizes, so the length check runs first. Tokens map to bot names in the application environment.
 
 ```erlang
 %% In src/chat_server.app.src
-  {applications, [kernel, stdlib, crypto, inets, ssl]},
+  {applications, [kernel, stdlib, crypto, mnesia, ssl, inets]},
   {env, [
+      {port, 8080},
       {api_tokens, [{<<"s3cr3t-deploy-token">>, <<"deploy">>}]},
       {webhook_urls, ["http://localhost:9000/hook"]}
   ]}
 ```
 
-Keep real tokens in `sys.config` on the server (lesson 25), not in git. `inets` and `ssl` are for the webhooks below.
+That is the full list after every lesson so far, so check yours against it. `mnesia` arrived in lesson 28 and `ssl` in lesson 34, and dropping either breaks a release even though `rebar3 shell` still works. Keep real tokens in `sys.config` (lesson 25), not in git. `inets` is for the webhooks below.
 
 ## Bots in a Room
 
-`chat_room:send_message/3` answers `{error, not_member}` to outsiders, and a bot has no connection process that could join. Instead of faking a member, `post_as_bot/3` skips the membership check, and only `chat_api` calls it, after the token check. The `bot:` prefix cannot impersonate a user, because `chat_auth` rejects a colon in usernames.
+`chat_room:send_message/3` answers `{error, not_member}` to outsiders, and a bot has no connection process that could join. Rather than fake a member, `post_as_bot/3` skips the membership check, and only `chat_api` calls it, after the token check. The `bot:` prefix cannot impersonate a user, because `chat_auth` rejects a colon in usernames.
 
 Neither new function may start a room, or every guessed URL would create a process.
 
@@ -186,21 +187,22 @@ call_existing(Room, Request) ->
     end.
 
 %% The true branch of the message clause shrinks to
-        true -> {reply, ok, publish(Sender, Text, State)};
+        true -> {reply, ok, deliver(Sender, Text, State)};
 %% and these clauses are new.
 handle_call({bot_message, Bot, Text}, _From, State) ->
-    {reply, ok, publish(Bot, Text, State)};
+    {reply, ok, deliver(Bot, Text, State)};
 handle_call(history, _From, #{history := History} = State) ->
     {reply, {ok, lists:reverse(History)}, State};
 
-publish(From, Text, #{name := Name, history := History} = State) ->
+deliver(From, Text, #{name := Name} = State) ->
     Event = #{type => message, room => Name, from => From, text => Text},
-    notify(Event, State),
+    publish(Event, State),
+    ok = chat_store:save_message(Name, From, Text),
     chat_events:notify({message, Name, From, Text}),
-    State#{history := lists:sublist([Event | History], ?HISTORY_SIZE)}.
+    remember(Event, State).
 ```
 
-`publish/3` is also the place for the `chat_events:notify/1` call from lesson 38 and `chat_store:save_message/3` from lesson 28, so bot messages are stored and announced like any other. To serve more than 50 messages, answer the GET route from `chat_store:recent_messages(Room, N)`.
+Both message paths now meet in `deliver/3`, so a bot message travels as far as a person's. It reuses `publish/2` and `remember/2` from lesson 31, which reach the same room on other nodes, saves with `chat_store:save_message/3` from lesson 28, and announces with `chat_events:notify/1` from lesson 38. Drop the line for any lesson you skipped. To serve more than 50 messages, answer the GET route from `chat_store:recent_messages(Room, N)`.
 
 The connection needs one new clause. Put it above the 404 clause, next to `/health` from lesson 36.
 
@@ -312,7 +314,7 @@ post(Url, Body, Attempt) ->
     end.
 ```
 
-Register it with `gen_event:add_handler(chat_events, chat_webhook_handler, [])` next to the other handlers. Then listen with `nc -l 9000` in a second terminal and write a chat message.
+Add `chat_webhook_handler => []` to the map in `chat_events_guard:init/1`, so it is supervised like the handlers in lesson 38. Then listen with `nc -l 9000` in a second terminal and write a chat message.
 
 ```text
 $ nc -l 9000
@@ -325,7 +327,7 @@ connection: keep-alive
 {"type":"message","text":"hello from the browser","room":"erlang","from":"alice"}
 ```
 
-`nc` never answers, so stop it with Ctrl-C. The chat kept working meanwhile. The retries find nobody listening, and the log says so.
+`nc` never answers, so stop it with Ctrl-C. The chat kept working meanwhile, and the retries find nobody listening.
 
 ```text
 =WARNING REPORT==== 19-Sep-2026::11:01:31.615341 ===

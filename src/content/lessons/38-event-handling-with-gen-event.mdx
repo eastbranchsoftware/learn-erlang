@@ -9,11 +9,11 @@ difficulty: "advanced"
 
 import ErlangKoans from '../../components/ErlangKoans.astro';
 
-The last behaviour from the list in lesson 11 is `gen_event`. It solves a problem our code already has. `chat_connection` calls `chat_stats` directly, several modules call the logger, and moderation and webhooks are next. Every new concern edits the core modules. An event manager inverts that. The core says "this happened" once, and anyone who cares installs a handler.
+The last behaviour from lesson 11's list is `gen_event`, and it solves a problem our code already has. `chat_connection` calls `chat_stats` directly, several modules call the logger, and moderation and webhooks are next, so every new concern edits the core modules. An event manager inverts that: the core says "this happened" once, and anyone who cares installs a handler.
 
 ## One Process, Many Handlers
 
-`gen_event:start_link/1` starts an **event manager**. The manager is one process that holds a list of **handlers**. A handler is a callback module plus its own state. `gen_event:notify/2` sends an event to the manager, and the manager calls `handle_event/2` of every handler, one after the other.
+`gen_event:start_link/1` starts an **event manager**, one process holding a list of **handlers**. A handler is a callback module plus its own state. `gen_event:notify/2` sends an event to the manager, which calls `handle_event/2` of every handler in turn.
 
 Handlers are not processes. They run inside the manager process, and that one fact explains how gen_event behaves.
 
@@ -35,7 +35,7 @@ notify(Event) ->
     gen_event:notify(?MODULE, Event).
 ```
 
-`notify/2` is asynchronous like a cast and returns `ok` even when no handler is installed. `gen_event:sync_notify/2` returns after every handler has seen the event. That makes the caller wait for the slowest handler, so the core uses `notify/2`.
+`notify/2` is asynchronous like a cast and returns `ok` even when no handler is installed. `gen_event:sync_notify/2` returns only after every handler has seen the event, which makes the caller wait for the slowest one, so the core uses `notify/2`.
 
 ## Handlers
 
@@ -52,10 +52,12 @@ A handler implements `init/1`, `handle_event/2` and `handle_call/2`. `handle_inf
 init([]) ->
     {ok, #{}}.
 
-handle_event(Event, Counts) ->
+handle_event(Event, Counts) when is_tuple(Event) ->
     Counter = counter(element(1, Event)),
     chat_stats:increment(Counter),
-    {ok, Counts#{Counter => maps:get(Counter, Counts, 0) + 1}}.
+    {ok, Counts#{Counter => maps:get(Counter, Counts, 0) + 1}};
+handle_event(_Event, Counts) ->
+    {ok, Counts}.
 
 handle_call(counts, Counts) ->
     {ok, Counts, Counts}.
@@ -104,7 +106,7 @@ terminate(_Reason, #{flagged := Flagged}) ->
     ok.
 ```
 
-Every handler sees every event, so each needs a catch-all clause. `terminate/2` runs when the handler is deleted, when it crashes and when the manager stops.
+Every handler sees every event, so each needs a catch-all clause. `terminate/2` runs when the handler is deleted, when it crashes, and when the manager stops.
 
 The third handler writes events to `logger` as structured reports (lesson 26). Its state is the log level.
 
@@ -135,7 +137,7 @@ handle_call(_Request, Level) ->
 
 ## Installing Handlers Under Supervision
 
-`gen_event:add_handler/3` installs a handler, and if that handler crashes later it is gone for good. `gen_event:add_sup_handler/3` also links the manager and the calling process. When the handler is removed, the caller gets `{gen_event_EXIT, Handler, Reason}`. The reason is `normal` for a delete, `shutdown` when the manager stops, and the error for a crash. When the caller dies, the manager deletes the handler. We'll give that job to a small gen_server.
+`gen_event:add_handler/3` installs a handler, and if it crashes later it is gone for good. `gen_event:add_sup_handler/3` also links the manager and the caller, which then gets `{gen_event_EXIT, Handler, Reason}` when the handler is removed. The reason is `normal` for a delete, `shutdown` when the manager stops, and the error for a crash. A small gen_server takes that job.
 
 **Create `src/chat_events_guard.erl`:**
 
@@ -177,7 +179,7 @@ install(Handler, Args) ->
     ok = gen_event:add_sup_handler(chat_events, Handler, Args).
 ```
 
-The guard installs a crashed handler again with a fresh state. The alternative is to return `{stop, Reason, Handlers}` and let the supervisor's restart intensity decide. That is stricter, and a moderation bug could then take the whole application down.
+The guard installs a crashed handler again with a fresh state. The alternative is to return `{stop, Reason, Handlers}` and let the supervisor's restart intensity decide. That is stricter, and a moderation bug could then take the application down.
 
 **Update `src/chat_server_sup.erl`.** Add two children right after `chat_stats`, before anything that publishes events.
 
@@ -188,7 +190,9 @@ The guard installs a crashed handler again with a fresh state. The alternative i
         #{id => chat_events_guard, start => {chat_events_guard, start_link, []}},
 ```
 
-`modules => dynamic` tells release upgrades (lesson 33) that the set of callback modules changes at runtime. If the manager dies, the link takes the guard with it, and the supervisor restarts both in order.
+`modules => dynamic` tells release upgrades (lesson 33) that the set of callback modules changes at runtime.
+
+If the manager dies, the link from `add_sup_handler/3` takes the guard with it and both restart. `chat_server_sup` is `one_for_one`, which restarts children in no particular order, so a guard that wins the race calls `add_sup_handler/3` before the manager exists and crashes with `noproc`. One child needing another is what `rest_for_one` is for in lesson 14. Put this pair under their own `rest_for_one` supervisor, or accept one guard crash before it restarts behind the manager.
 
 ## Publishing Events
 

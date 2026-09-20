@@ -9,20 +9,20 @@ difficulty: "advanced"
 
 import ErlangKoans from '../../components/ErlangKoans.astro';
 
-Lesson 31 spread rooms over two nodes. More machines mean more things that fail. A node crashes, a cable is pulled, a switch reboots. Supervisors restart processes, but no supervisor restarts a data centre. We'll look at what each failure does to the chat server and fix the parts that cope badly.
+Lesson 31 spread rooms over two nodes. More machines mean more things that fail: a node crashes, a cable is pulled, a switch reboots. Supervisors restart processes, but no supervisor restarts a data centre. We'll look at what each failure does to the chat server and fix what copes badly.
 
 ## Crash or Partition
 
-From inside a node, both failures look the same. `chat_cluster` gets `{nodedown, Node}`. The other node may be dead, or it may be running and thinking the same about us. No message can tell the two apart, because the network that would carry it is what failed. Code that reacts to `nodedown` must be correct in both cases.
+From inside a node, both failures look the same. `chat_cluster` gets `{nodedown, Node}`. The other node may be dead, or running and thinking the same about us. No message can tell the two apart, because the network that would carry it is what failed. Code that reacts to `nodedown` must be correct in both cases.
 
-How fast the message comes depends on the failure. A VM that exits closes its TCP connections, and the peer knows within milliseconds. A machine that loses power closes nothing. Connected nodes exchange ticks, and a node that stays silent for `net_ticktime` seconds is declared down. The default is 60.
+How fast it comes depends on the failure. A VM that exits closes its TCP connections and the peer knows within milliseconds. A machine that loses power closes nothing. Connected nodes exchange ticks, and one that stays silent for `net_ticktime` seconds is declared down. The default is 60.
 
 ```erlang
 (a@localhost)1> net_kernel:get_net_ticktime().
 60
 ```
 
-Lower it in `config/vm.args` with `-kernel net_ticktime 20`. Every node must use the same value. A short tick time finds dead machines sooner, but a node that stalls for a few seconds under load gets disconnected although it is healthy.
+Lower it in `config/vm.args` with `-kernel net_ticktime 20`, the same value on every node. A short tick time finds dead machines sooner, but disconnects a healthy node that stalls under load.
 
 ## What a Dead Node Takes With It
 
@@ -37,11 +37,11 @@ cluster: a@localhost is down, connected to []
 [<0.176.0>]
 ```
 
-`pg` dropped the remote room, so `publish/2` stops forwarding to it. `global` removed Alice's name. `chat_cluster` tries to reconnect every five seconds. The server side needs no new code. What is left is Alice. Her socket is closed, and her session token was in the memory of `chat_auth` on the dead node.
+`pg` dropped the remote room, so `publish/2` stops forwarding to it, `global` removed Alice's name, and `chat_cluster` retries every five seconds. The server side needs no new code. What is left is Alice: her socket is closed, and her session token was in the memory of `chat_auth` on the dead node.
 
 ## A Client That Comes Back
 
-Behind a load balancer, a new connection to the same address reaches a node that is alive. The client must retry, and it must not retry too eagerly. A thousand clients that reconnect in the same second can take down the node that survived. Each failed attempt doubles the wait up to a ceiling. A random part, the jitter, spreads clients that were cut off at the same moment.
+Behind a load balancer, a new connection to the same address reaches a live node. The client must retry, but not too eagerly: a thousand clients reconnecting in the same second can take down the survivor. Each failed attempt doubles the wait up to a ceiling, and a random part, the jitter, spreads clients that were cut off together.
 
 **Update `priv/index.html`.** Replace the line that creates `ws` with two variables.
 
@@ -79,9 +79,9 @@ The `auth` message from lesson 21 logs the user in again. It only works if the n
 
 ## Sessions on Every Node
 
-One option is to ask the other nodes with `erpc`. That fails in the one case we care about, because the node that issued the token is the one that died. So the session must already be on the surviving node. Mnesia can replicate a table, and `chat_store` already uses it. Sessions go into a `ram_copies` table on every node. That still costs no disk write, which was the concern in lesson 28, and they survive as long as one node is up.
+Asking the other nodes with `erpc` fails in the one case we care about, because the node that issued the token is the one that died. The session must already be on the survivor. Mnesia replicates tables and `chat_store` already uses it, so sessions go into a `ram_copies` table on every node. That costs no disk write, and they survive as long as one node is up.
 
-A node chooses between two roles with a new `primary` key in its config file, next to `cluster_nodes`. Both files carry `{primary, 'a@localhost'}`. Two nodes on one machine also need separate data directories, so add `{mnesia, [{dir, "mnesia_a"}]}` to `config/a.config` and `mnesia_b` to the other.
+A node picks its role with a new `primary` key next to `cluster_nodes`, and both config files carry `{primary, 'a@localhost'}`. Two nodes on one machine also need separate data directories, so add `{mnesia, [{dir, "mnesia_a"}]}` to `config/a.config` and `mnesia_b` to the other.
 
 **Update `src/chat_store.erl`:**
 
@@ -125,11 +125,11 @@ delete_session(Token) ->
     mnesia:dirty_delete(chat_session, Token).
 ```
 
-`create_tables/0` is the body of `init/0` from lesson 28 with two changes. It also calls `ensure_table/2` for `chat_session` with `{ram_copies, [node()]}`, and it waits for `?TABLES`. Export `join_cluster/1` and the three session functions. A token is a fresh random key, so dirty operations are enough, as for messages.
+`create_tables/0` is the body of `init/0` from lesson 28, plus an `ensure_table/2` call for `chat_session` with `{ram_copies, [node()]}`, waiting for `?TABLES`. Export `join_cluster/1` and the three session functions. A token is a fresh random key, so dirty operations are enough.
 
-`join_cluster/1` has three steps. `extra_db_nodes` connects this node's Mnesia to a running one and fetches the schema. `change_table_copy_type/3` makes the local schema copy persistent. `add_table_copy/3` adds a replica of each table here. On later starts the copies exist, which `copy/2` accepts. A node that created its own tables earlier cannot join. Delete its Mnesia directory first.
+`extra_db_nodes` connects this node's Mnesia to a running one and fetches the schema, `change_table_copy_type/3` makes the local schema copy persistent, and `add_table_copy/3` adds a replica of each table. On later starts the copies exist, which `copy/2` accepts. A node that created its own tables earlier cannot join, so delete its Mnesia directory first.
 
-In `chat_auth`, the `sessions` map goes away and `init/1` returns `{ok, #{}}`. The `login` clause calls `chat_store:save_session(Token, Username, Expires)`, and `logout` calls `chat_store:delete_session(Token)`. This is the `verify` clause.
+In `chat_auth` the `sessions` map goes away and `init/1` returns `{ok, #{}}`. The `login` clause calls `chat_store:save_session(Token, Username, Expires)` and `logout` calls `chat_store:delete_session(Token)`. This is the `verify` clause.
 
 ```erlang
 %% In src/chat_auth.erl
@@ -146,7 +146,7 @@ handle_call({verify, Token}, _From, State) ->
     end;
 ```
 
-We ran this with scripted clients. Alice logged in on `a`, we halted `a`, and a new connection to `b` sent her token.
+We ran this with scripted clients: Alice logged in on `a`, we halted it, and a new connection to `b` sent her token.
 
 ```erlang
 (b@localhost)9> mnesia:system_info(running_db_nodes).
@@ -161,7 +161,7 @@ ok
    <<"type">> => <<"system">>}]
 ```
 
-Accounts are replicated too, so Bob can register on `b` and log in on `a`. We also ran the JavaScript above against node `a` and restarted that node. The waits are real. After the restart, `a` loaded the session table from `b`, and the token still worked.
+Accounts are replicated too, so Bob can register on `b` and log in on `a`. We also ran the browser client against `a` and restarted it. The waits below are real, and afterwards `a` loaded the session table from `b` with the token still valid.
 
 ```text
 3.0s connection lost, retrying in 1 s
@@ -173,7 +173,7 @@ Accounts are replicated too, so Bob can register on `b` and log in on `a`. We al
 
 ## Writing While a Replica Is Down
 
-A Mnesia write, dirty or in a transaction, goes to every replica that is running. A replica that is down does not block it. While `a` was down, Alice wrote `a is down` through node `b`. When `a` came back, it loaded its tables from `b`, the node that kept running.
+A Mnesia write, dirty or in a transaction, goes to every running replica, and one that is down does not block it. While `a` was down, Alice wrote `a is down` through `b`. When `a` came back it loaded its tables from `b`.
 
 ```erlang
 (a@localhost)1> mnesia:system_info(running_db_nodes).
@@ -183,13 +183,13 @@ A Mnesia write, dirty or in a transaction, goes to every replica that is running
    from => <<"alice">>}]
 ```
 
-This is safe because only one side changed. Mnesia knows that `b` saw `a` go down and never the reverse. The rule has a cost. A node that stopped first waits for the node that ran last. Started alone, `b` got no tables within ten seconds and `init/0` failed, until `a` was up.
+This is safe because only one side changed, and Mnesia knows `b` saw `a` go down and never the reverse. The rule has a cost: a node that stopped first waits for the one that ran last. Started alone, `b` got no tables within ten seconds and `init/0` failed until `a` was up.
 
 ## When Both Sides Keep Writing
 
-In a partition both nodes stay up, both see `nodedown`, and both accept writes. When the network heals, each side holds data the other lacks. Mnesia does not merge. It keeps both sides as they are, stops replicating between them, and reports `{inconsistent_database, running_partitioned_network, Node}` to subscribers of its system events. The application must pick a winner.
+In a partition both nodes stay up, both see `nodedown`, and both accept writes. When the network heals, each side holds data the other lacks. Mnesia does not merge. It keeps both sides as they are, stops replicating between them, and reports `{inconsistent_database, running_partitioned_network, Node}` to subscribers of its system events. The application picks the winner.
 
-Our policy is short. The primary's data wins. Every other node throws its copy away and reloads from the primary. Messages and sessions written on the losing side during the split are lost. For chat that is acceptable. A few lost lines hurt less than a database that never agrees again. For payments it would be wrong, and you would need a store that refuses writes on the minority side.
+Our policy is short. The primary's data wins, and every other node reloads from it. Messages and sessions written on the losing side during the split are lost. For chat that is acceptable, because a few lost lines hurt less than a database that never agrees again. For payments it would be wrong, and you would need a store that refuses writes on the minority side.
 
 **Create `src/chat_partition.erl`:**
 
@@ -238,9 +238,9 @@ reload_from(Primary) ->
 
 Add it to the children of `chat_server_sup` with `#{id => chat_partition, start => {chat_partition, start_link, []}}`.
 
-Master nodes tell Mnesia where to load tables from at startup, whatever its own logs say. We clear them after the reload. In our test, a node with master nodes left in place could not load its tables when it later started alone. Stopping Mnesia ends the subscription, so we subscribe again. Calls into `chat_store` fail for the moment Mnesia is down, and clients whose connection crashes reconnect.
+`set_master_nodes/1` tells Mnesia where to load tables from at startup, whatever its own logs say. We clear it after the reload, because in our test a node that kept it could not load its tables when it later started alone. Stopping Mnesia ends the subscription, so we subscribe again. Calls into `chat_store` fail while it is down, and clients whose connection crashes reconnect.
 
-A real partition is hard to stage on one machine. `erlang:disconnect_node/1` alone does not work, because the nodes reconnect within milliseconds. A wrong cookie keeps them apart. On `a` we ran this and saved a message.
+A real partition is hard to stage on one machine. `erlang:disconnect_node/1` alone does not work, because the nodes reconnect within milliseconds, but a wrong cookie keeps them apart. On `a` we ran this and saved a message:
 
 ```erlang
 (a@localhost)3> erlang:set_cookie('b@localhost', wrong), erlang:disconnect_node('b@localhost').
@@ -262,13 +262,13 @@ mnesia: reloading all tables from a@localhost
 [<<"a is down">>,<<"written on a">>]
 ```
 
-`written on b` is gone, as the policy says. Every transcript here is from a real run with two nodes on one machine. The 60 second detection of a machine without power is the one thing we did not stage.
+`written on b` is gone, as the policy says. Every transcript here is from a real run with two nodes on one machine. Detecting a machine without power is the one case we did not stage.
 
 ## Exercises
 
 **Exercise 1: Rejoin rooms after a reconnect**
 
-After `auth` the server puts the user into `lobby` only. Make the client remember its rooms and join them again.
+After `auth` the server puts the user into `lobby` only. Make the client remember its rooms and rejoin them.
 
 ```javascript
 const rooms = new Set();
@@ -278,7 +278,7 @@ const rooms = new Set();
 
 **Exercise 2: Tell users about a lost node**
 
-Give `chat_cluster` a job in its `nodedown` clause. Broadcast a system event to the local users.
+Give `chat_cluster` a job in its `nodedown` clause: broadcast a system event to the local users.
 
 ```erlang
 % Expected on every client of node b after node a stops:
@@ -287,7 +287,7 @@ Give `chat_cluster` a job in its `nodedown` clause. Broadcast a system event to 
 
 **Exercise 3: Refuse to be a minority**
 
-With three nodes, a side that sees fewer than half of the expected nodes could stop accepting messages instead of losing them later.
+With three nodes, a side that sees fewer than half the expected nodes could stop accepting messages instead of losing them later.
 
 ```erlang
 has_quorum() ->
@@ -302,12 +302,12 @@ has_quorum() ->
 
 ## Key Takeaways
 
-- **`nodedown` does not say why**. A crash and a partition look the same, so handlers must be right for both
+- **`nodedown` does not say why**. A crash and a partition look the same, so handlers must be right for both cases
 - **`net_ticktime`** bounds how long a silent machine goes unnoticed. Lower values detect faster and disconnect busy nodes by mistake
 - **`pg` and `global` clean up after a dead node**. State you keep yourself is your job
 - **Clients reconnect with exponential backoff and jitter**, or the surviving node gets every client at once
-- **State needed after a failover must already be on the survivor**. Sessions live in a replicated `ram_copies` table
-- **`extra_db_nodes`, `change_table_copy_type/3`, `add_table_copy/3`** join a node to a Mnesia cluster. Writes skip replicas that are down, and those catch up on restart
+- **State needed after a failover must already be on the survivor**, so sessions live in a replicated `ram_copies` table
+- **`extra_db_nodes`, `change_table_copy_type/3` and `add_table_copy/3`** join a node to a Mnesia cluster. Writes skip replicas that are down, and those catch up on restart
 - **Mnesia detects a healed partition but never merges**. Subscribe with `mnesia:subscribe(system)` and apply a policy you chose on purpose
 
 ## Interactive Koans
@@ -321,14 +321,6 @@ has_quorum() ->
       answer: "8000",
       hint: "bsl 3 multiplies by 2 three times.",
       explanation: "1000 bsl 3 is 8000. Each failed attempt doubles the wait."
-    },
-    {
-      id: "l32_backoff_capped",
-      question: "What is the ceiling for attempt 10?",
-      code: "Ceiling = fun(Attempt) -> min(30000, 1000 bsl Attempt) end.\nCeiling(10).\n% => ___",
-      answer: "30000",
-      hint: "1000 bsl 10 is 1024000. Look at min/2.",
-      explanation: "min/2 caps the wait at 30 seconds, so a client never waits for minutes after a long outage."
     },
     {
       id: "l32_subscribe_system",

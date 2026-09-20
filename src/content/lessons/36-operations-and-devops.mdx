@@ -1,0 +1,289 @@
+---
+title: "Operations and DevOps"
+description: "Run the chat server as a service with a health endpoint, a container image, graceful shutdown, a live console and CI"
+postNumber: 36
+publishDate: 2026-09-19T00:00:00Z
+tags: ["advanced", "operations", "devops"]
+difficulty: "advanced"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+Lesson 35 spread connections over several nodes. Something now has to decide which of those nodes is fit to receive traffic, start them the same way every time, and stop them without cutting people off.
+
+## A Health Endpoint
+
+A load balancer needs one cheap request that says whether this node should get connections. `chat_metrics:snapshot/0` from lesson 26 already collects the numbers, so the endpoint is one more `handle_request/2` clause, next to the `/api/...` clause lesson 39 adds and above the 404.
+
+```erlang
+%% In src/chat_connection.erl
+handle_request(#{method := 'GET', path := <<"/health">>}, State) ->
+    Snapshot = chat_metrics:snapshot(),
+    Healthy = not application:get_env(chat_server, draining, false)
+        andalso maps:get(max_queue_len, Snapshot) < 1000,
+    {Status, Text} = case Healthy of
+        true -> {200, ok};
+        false -> {503, unavailable}
+    end,
+    respond(Status, <<"application/json">>, json:encode(Snapshot#{status => Text}), State);
+```
+
+Add `reason(503) -> <<"Service Unavailable">>;` to `src/chat_http.erl`, which has not needed that code before.
+
+```bash
+$ curl -s -i localhost:8080/health
+HTTP/1.1 200 OK
+Content-Length: 119
+Content-Type: application/json
+Connection: close
+
+{"memory":51512065,"messages":0,"process_count":93,"status":"ok","users":0,"connections":1,"max_queue_len":0,"rooms":0}
+```
+
+`connections` is 1 because the health check is itself a connection. After `application:set_env(chat_server, draining, true)` the same request answers `503 Service Unavailable` with `"status":"unavailable"`, and the balancer stops sending new clients.
+
+Two different questions get confused here. Liveness asks whether the process should be killed and restarted, so it must only fail when the node is broken beyond recovery. Readiness asks whether the node should receive traffic right now, which is what `draining` and a long message queue answer, and a failing readiness check must not restart anything.
+
+## A Container Image
+
+A release is a directory, and a container image is a directory plus a process to start. Build it in two stages so the shipped image has no compiler, no source and no rebar3.
+
+```dockerfile
+FROM erlang:28 AS build
+WORKDIR /src
+COPY rebar.config ./
+COPY config config
+COPY src src
+COPY priv priv
+RUN rebar3 as prod tar && \
+    mkdir /release && \
+    tar -xzf _build/prod/rel/chat_server/chat_server-*.tar.gz -C /release
+
+FROM debian:trixie-slim
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libssl3 libncurses6 libstdc++6 && \
+    rm -rf /var/lib/apt/lists/* && \
+    useradd --system --home-dir /opt/chat_server chat
+COPY --from=build --chown=chat:chat /release /opt/chat_server
+USER chat
+ENV PORT=8080
+EXPOSE 8080
+CMD ["/opt/chat_server/bin/chat_server", "foreground"]
+```
+
+`rebar3 as prod tar` produces the tarball from lesson 25, with ERTS inside it. A `.dockerignore` keeps the build context small and stops a local build directory from leaking into the image.
+
+```text
+_build
+.git
+.github
+log
+test
+erl_crash.dump
+```
+
+The runtime stage must be the same operating system as the build stage. ERTS is compiled against the builder's C library, and `debian:bookworm-slim` under an `erlang:28` builder produces this.
+
+```text
+/opt/chat_server/erts-16.4.0.6/bin/epmd: /lib/aarch64-linux-gnu/libc.so.6:
+version `GLIBC_2.38' not found
+```
+
+`erlang:28` is Debian 13 today, so the runtime stage is `debian:trixie-slim`. Check with `docker run --rm erlang:28 cat /etc/os-release` rather than assuming, and pin both tags.
+
+`foreground` runs the node attached to stdout with no shell, which is what a container runtime expects as PID 1. `daemon` would fork away and the container would exit immediately. `USER chat` means a container escape does not start as root.
+
+```bash
+$ docker build -t chat_server .
+$ docker run -d -p 8080:8080 -e COOKIE=$COOKIE chat_server
+$ docker logs $(docker ps -ql) | tail -1
+Chat server listening on port 8080 with 10 acceptors
+$ docker exec $(docker ps -ql) id
+uid=999(chat) gid=999(chat) groups=999(chat)
+```
+
+The image is 186 MB, most of it Debian. `PORT` reaches `sys.config.src` through the `${PORT:-8080}` substitution from lesson 25.
+
+## Graceful Shutdown
+
+`docker stop` and `systemctl stop` both send SIGTERM. The VM's default handler for it calls `init:stop()`, which stops applications in reverse start order and only then halts. Inside `chat_server`, the supervisor terminates its children in reverse start order too, so `chat_listener` dies before `chat_conn_sup`. No new connection is accepted while the existing ones are still being closed.
+
+A supervisor shutdown kills a child outright unless the child traps exits, so add `process_flag(trap_exit, true)` to `chat_connection:init/1`. Now `terminate/2` runs first, with `shutdown` as the reason, and it can tell the client why the socket is closing. Code 1001 means the endpoint is going away.
+
+```erlang
+%% In src/chat_connection.erl
+terminate(shutdown, #state{phase = websocket, socket = Socket} = State) ->
+    send_frame({close, <<1001:16>>}, State),
+    chat_transport:close(Socket);
+terminate(_Reason, #state{socket = Socket}) ->
+    chat_transport:close(Socket).
+```
+
+A scripted client logged in, then the release got `kill -TERM`.
+
+```text
+{close,<<3,233>>} after 37 ms
+close code 1001
+then closed
+```
+
+`<<3,233>>` is 1001 as a 16-bit integer. The client from lesson 32 sees the close, waits its backoff, and reconnects to another node. `docker stop` on an idle container took 1.2 seconds end to end, well inside its 10 second grace period.
+
+Shutting down is still abrupt for the clients on that node. A deploy should first set `draining` so the health check fails, wait for the balancer to notice, and only then stop. Exercise 1 builds that.
+
+## The Console on a Live Node
+
+`bin/chat_server remote_console` from lesson 25 attaches a shell to the running node. Without the release script, the same thing is `erl -hidden -sname ops -setcookie $COOKIE -remsh chat_server@localhost`. `-hidden` keeps the console out of the server's `nodes/0`, so the cluster code from lesson 30 never treats it as a peer.
+
+Look at three things first. `chat_metrics:snapshot/0` says whether the node is busy or stuck. `chat_metrics:top(message_queue_len, 3)` names the processes falling behind, and `top(memory, 3)` the ones that grew. `sys:get_state/1` on a suspect pid shows what it believes about the world.
+
+Everything typed there runs on the production node. `q()` stops it, and so does `init:stop()` and `halt()`. Leave with Ctrl+G then `q`, or Ctrl+C twice. Avoid anything that iterates over every process while the node is under load, and switch `logger:set_module_level/2` back off when you are done, because `chat_connection` at debug level logs passwords.
+
+## Continuous Integration
+
+The same commands run in CI. `erlef/setup-beam` installs OTP and rebar3, the cache keeps the dialyzer PLT between runs, and the release tarball is uploaded so a deploy uses the artifact the tests ran against.
+
+```yaml
+name: CI
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          rebar3-version: "3.25"
+      - uses: actions/cache@v4
+        with:
+          path: _build/default/rebar3_*_plt
+          key: plt-otp28-${{ hashFiles('rebar.config') }}
+      - run: rebar3 compile
+      - run: rebar3 eunit
+      - run: rebar3 ct
+      - run: rebar3 dialyzer
+      - run: rebar3 as prod tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chat_server-release
+          path: _build/prod/rel/chat_server/*.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ct-logs
+          path: _build/test/logs
+```
+
+`rebar3 eunit` runs the tests from lesson 23 and `rebar3 ct` the suite from lesson 24. `rebar3 dialyzer` type checks without any annotations, by inferring what each function can actually return. Building the PLT takes a minute; after that a run takes seconds. Our code passes clean. Give a function a clause that cannot match and the run says so.
+
+```text
+src/chat_metrics.erl
+Line 53 Column 9: The pattern 'undefined' can never match the type
+  #{'capacity':=float(), 'last':=integer(), 'rate':=_, 'tokens':=float()}
+===> Warnings occurred running dialyzer: 1
+```
+
+Dialyzer exits non-zero on a warning, so the job fails. On an existing code base it is common to start from a list of accepted warnings and shrink it.
+
+## Exercises
+
+**Exercise 1: Drain before stopping**
+
+Write `chat_drain:run(NoticeMs, SpreadMs)` that sets `draining`, sleeps while the balancer notices, terminates `chat_listener` through `supervisor:terminate_child/2`, then closes the connections spaced over `SpreadMs` before `init:stop()`.
+
+```erlang
+% Pause between closes: SpreadMs div max(1, length(Pids))
+% Expected: no client sees a closed socket without a 1001 frame first
+```
+
+**Exercise 2: A readiness check that means something**
+
+Make `/health` fail while the node is still starting. Set an app env key at the end of `chat_server_app:start/2` and require it.
+
+```erlang
+% Expected: 503 between process start and a working listen socket
+```
+
+**Exercise 3: Test the endpoint in CI**
+
+Add a Common Test case to `test/chat_SUITE.erl` that requests `/health` and asserts a 200 and a decoded map with a `status` key.
+
+```erlang
+% Reuse chat_http:parse_request/1 on the response, or match the status line
+% Expected: a red build if a metrics key disappears
+```
+
+## Key Takeaways
+
+- **Health is two questions.** Liveness restarts a broken node, readiness only withholds traffic
+- **Build the release in one stage, ship it in another**, and match the runtime image to the builder's libc or ERTS will not start
+- **`foreground` is the container command**, because the runtime wants a process that stays in the foreground and writes to stdout
+- **SIGTERM calls `init:stop/0`**, applications and supervisor children stop in reverse start order, so the listener closes before the connections
+- **Close with 1001** in `terminate/2` so clients reconnect on purpose instead of by timeout
+- **A live console runs on production.** Never type `q().`, leave with Ctrl+G then q
+- **CI runs the same commands you do**, and publishes the tarball the tests ran against
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l36_stop_order",
+      question: "Which lists function turns the start order into the shutdown order?",
+      code: "Started = [chat_stats, chat_registry, chat_auth, chat_conn_sup, chat_listener].\nlists:___(Started).\n% => [chat_listener, chat_conn_sup, chat_auth, chat_registry, chat_stats]",
+      answer: "reverse",
+      hint: "The child started last is terminated first.",
+      explanation: "Reverse start order means chat_listener stops before chat_conn_sup, so nothing new is accepted while connections are closing."
+    },
+    {
+      id: "l36_health_status",
+      question: "Which status code does the endpoint return when the node should not get traffic?",
+      code: "status(#{max_queue_len := Queued}) when Queued < 1000 -> 200;\nstatus(_Snapshot) -> ___.\n\nstatus(#{max_queue_len => 0}).\n% => 200\nstatus(#{max_queue_len => 5000}).\n% => 503",
+      answer: "503",
+      hint: "Service Unavailable.",
+      explanation: "A readiness failure is 503. The balancer stops sending clients and nothing restarts the node."
+    },
+    {
+      id: "l36_close_code",
+      question: "Which close code is in this payload from a shutting down server?",
+      code: "close_code(<<Code:16, _Reason/binary>>) -> Code.\n\nclose_code(<<3, 233>>).\n% => ___",
+      answer: "1001",
+      hint: "Read the two bytes as one 16-bit integer.",
+      explanation: "1001 means the endpoint is going away, which tells the client to reconnect rather than to give up."
+    },
+    {
+      id: "l36_trap_exit",
+      question: "Which process_flag value lets the child run its cleanup on a supervisor shutdown?",
+      code: "cleanup(Parent) ->\n    Parent ! ready,\n    receive\n        {'EXIT', _From, shutdown} -> Parent ! sent_close_frame\n    after 1000 -> ok\n    end.\n\nParent = self().\nPid = spawn(fun() -> process_flag(trap_exit, ___), cleanup(Parent) end).\nreceive ready -> ok after 1000 -> timeout end.\nexit(Pid, shutdown).\nreceive sent_close_frame -> sent after 1000 -> timeout end.\n% => sent",
+      answer: "true",
+      hint: "Without it the exit signal kills the process outright.",
+      explanation: "A trapping process receives the shutdown as a message, which is what lets terminate/2 send the close frame before the socket goes."
+    },
+    {
+      id: "l36_json_body",
+      question: "Which json function builds the health response body from the snapshot map?",
+      code: 'iolist_to_binary(json:___(#{status => ok})).\n% => <<"{\\"status\\":\\"ok\\"}">>',
+      answer: "encode",
+      hint: "The opposite of what the connection does with an incoming text frame.",
+      explanation: "json:encode/1 returns an iolist, and the response function can send that as it is. iolist_to_binary/1 is only here to show the bytes."
+    },
+    {
+      id: "l36_sigterm",
+      question: "Which init function does the default SIGTERM handler call?",
+      code: "handle_signal(sigterm) ->\n    %% stops the applications in reverse order, then the VM\n    init:___();\nhandle_signal(_Other) ->\n    ignore.",
+      answer: "stop",
+      hint: "It is the orderly one, not halt/0.",
+      explanation: "init:stop/0 unwinds the supervision tree so terminate/2 runs. halt/0 would drop every connection without a close frame."
+    },
+    {
+      id: "l36_drain_pause",
+      question: "A 30 second window with 500 ms between closes. How many connections is that?",
+      code: "pause(WindowMs, Connections) ->\n    WindowMs div max(1, Connections).\n\npause(30000, 3000).\n% => 10\npause(30000, ___).\n% => 500",
+      answer: "60",
+      hint: "Divide the window by the number of connections.",
+      explanation: "Spreading the closes keeps a thousand clients from reconnecting to the surviving nodes in the same instant."
+    }
+  ]}
+/>
