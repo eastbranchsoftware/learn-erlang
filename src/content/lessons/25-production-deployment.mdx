@@ -9,13 +9,11 @@ difficulty: "advanced"
 
 import ErlangKoans from '../../components/ErlangKoans.astro';
 
-Every lesson so far started the chat server with `rebar3 shell`. That command compiles on the fly, needs the source tree and needs Erlang installed. It is a development tool. Production runs a release. Lesson 11 introduced the word, and now we build one.
+Every lesson so far started the chat server with `rebar3 shell`. That command needs the source tree and an Erlang install. It is a development tool. Production runs a release, a term from lesson 11.
 
 ## What a Release Is
 
-A release is a directory that holds everything the system needs to run. It contains the Erlang runtime system (ERTS), your application, the OTP applications it depends on, the configuration and a start script. You copy that directory to a server, run the script, and the chat server boots. The server needs no Erlang, no rebar3 and no source code.
-
-A release also boots differently from the shell. A boot script starts each application in dependency order, and only the applications that were packaged exist on the node.
+A release is a directory that holds everything the system needs to run. It contains the Erlang runtime system (ERTS), your application, the OTP applications it depends on, the configuration and a start script. You copy that directory to a server, run the script, and the chat server boots. The server needs no Erlang, no rebar3 and no source code. A boot script starts each packaged application in dependency order.
 
 ## The applications List Decides What Ships
 
@@ -68,11 +66,11 @@ init([]) ->
     {ok, {SupFlags, Children}}.
 ```
 
-`application:get_env/3` returns the value, or the third argument when the key is not set. `application:get_env/2` returns `{ok, Value}` or `undefined`. We read the port in the supervisor so `chat_listener` keeps taking it as an argument, which keeps it easy to test.
+`application:get_env/3` returns the value, or the third argument when the key is not set. `application:get_env/2` returns `{ok, Value}` or `undefined`.
 
 ## sys.config and vm.args
 
-Two files configure a node. `sys.config` is one Erlang term, a list of `{App, [{Key, Value}]}` tuples. Its values override the `env` defaults of each application at boot. Each deployment gets its own copy and the code stays the same.
+Two files configure a node. `sys.config` is one Erlang term, a list of `{App, [{Key, Value}]}` tuples. Its values override the `env` defaults of each application at boot.
 
 **Create `config/sys.config`:**
 
@@ -94,9 +92,9 @@ Two files configure a node. `sys.config` is one Erlang term, a list of `{App, [{
 +P 2000000
 ```
 
-`-sname` gives the node a name. The release script finds the running node by this name when you ask it to stop or to open a console. Use `-name` with a full host name when other machines must reach the node (lesson 29). We pin the host part to `localhost`. With a bare `-sname chat_server` the control commands must resolve the machine's short host name, and on many laptops they cannot. The symptom is `Node is not running!` from a node that runs fine.
+`-sname` gives the node a name. The release script finds the running node by this name. Use `-name` with a full host name when other machines must reach the node (lesson 29). We pin the host part to `localhost`. With a bare `-sname chat_server` the control commands must resolve the machine's short host name, and on many laptops they cannot. The symptom is `Node is not running!` from a node that runs fine.
 
-`-setcookie` sets the shared secret for node connections. Anyone with the cookie can run any code on the node, so generate a long random one for real deployments. `+P` raises the process limit. The default is 1,048,576 and every connection is a process, so this line only matters for very large servers. Older guides add `+K true` and `-heart`. `+K` was removed from the runtime years ago, and a service manager such as systemd does the job of `heart`.
+`-setcookie` sets the shared secret for node connections. Anyone with the cookie can run any code on the node, so generate a long random one for real deployments. `+P` raises the process limit. The default is 1,048,576 and every connection is a process, so this line only matters for very large servers. Older guides add `+K true`, which no longer exists, and `-heart`, whose job a service manager such as systemd now does.
 
 ## Configuring relx
 
@@ -132,7 +130,7 @@ rebar3 builds releases with a tool called relx, configured in `rebar.config`.
 ]}.
 ```
 
-The `release` tuple names the release, gives it a version and lists the top-level applications. relx follows each `applications` list from there. `sasl` adds the release handling tools that the start script expects. `dev_mode` builds the release out of symlinks into `_build`, so a recompile is visible without a rebuild. `include_erts` copies the runtime into the release. The `prod` profile turns symlinks off and the runtime on. The `config` line in the `shell` section makes `rebar3 shell` read the same `sys.config`.
+The `release` tuple names the release, gives it a version and lists the top-level applications. relx follows each `applications` list from there. `sasl` adds the release handling tools that the start script expects. `dev_mode` builds the release out of symlinks into `_build`, so a recompile is visible without a rebuild. `include_erts` copies the runtime into the release. The `prod` profile turns symlinks off and the runtime on. The `config` line makes `rebar3 shell` read the same `sys.config`.
 
 ## Building the Release
 
@@ -174,7 +172,7 @@ $ bin/chat_server eval 'chat_rooms:list_rooms().'
 $ bin/chat_server stop
 ```
 
-`bin/chat_server daemon` starts the node in the background and writes its output to `log/erlang.log.1` inside the release directory. `bin/chat_server console` starts it with an interactive shell, which is handy for a local try-out. Run the script with no arguments to see every command.
+`bin/chat_server daemon` starts the node in the background and writes its output to `log/erlang.log.1` inside the release directory. Run the script with no arguments to see every command.
 
 ## The Remote Console
 
@@ -190,9 +188,7 @@ Erlang/OTP 28 [erts-16.0.1] [source] [64-bit] [smp:8:8]
 [<<"lobby">>]
 (chat_server@localhost)3> application:get_env(chat_server, port).
 {ok,8080}
-(chat_server@localhost)4> [App || {App, _, _} <- application:which_applications()].
-[sasl,chat_server,crypto,stdlib,kernel]
-(chat_server@localhost)5> erlang:system_info(process_limit).
+(chat_server@localhost)4> erlang:system_info(process_limit).
 2097152
 ```
 
@@ -200,7 +196,7 @@ The prompt shows the name of the node you are on. Leave with Ctrl+G and then `q`
 
 ## Environment Variables in Config
 
-Editing `sys.config` inside each unpacked release gets old. relx can fill in OS environment variables when the node starts. Name the templates `sys.config.src` and `vm.args.src` and point the `prod` profile at them with `sys_config_src` and `vm_args_src`.
+relx can fill in OS environment variables when the node starts. Name the templates `sys.config.src` and `vm.args.src` and point the `prod` profile at them with `sys_config_src` and `vm_args_src`.
 
 ```erlang
 %% config/sys.config.src
@@ -233,7 +229,7 @@ $ cat releases/0.1.0/sys.config
 ].
 ```
 
-`${PORT:-8080}` falls back to 8080 when `PORT` is not set. Older guides tell you to export `RELX_REPLACE_OS_VARS=true`. With rebar3 3.25 the `.src` suffix alone is enough. There is one trap. The control commands render the templates again, so `ping`, `stop` and `remote_console` need the same variables in their environment. Without `COOKIE` they report `Node is not running!`. The build also prints a warning that `sys_config` is ignored in `prod`, which is what we want. `rebar3 shell` cannot read a template, so keep the plain `config/sys.config` for development.
+`${PORT:-8080}` falls back to 8080 when `PORT` is not set. Older guides tell you to export `RELX_REPLACE_OS_VARS=true`. With rebar3 3.25 the `.src` suffix alone is enough. There is one trap. The control commands render the templates again, so `ping`, `stop` and `remote_console` need the same variables in their environment. Without `COOKIE` they report `Node is not running!`. `rebar3 shell` cannot read a template, so keep the plain `config/sys.config` for development.
 
 ## Shipping It
 
@@ -251,7 +247,7 @@ pong
 
 The tarball is 12 MB. ERTS is a native binary, so build on the same operating system and CPU architecture as the server. A release built on a Mac does not start on Linux. Build on a matching machine or in a container (lesson 36).
 
-On a Linux server, systemd keeps the node running and restarts it after a crash or reboot.
+systemd keeps the node running after a crash or reboot.
 
 ```text
 [Unit]
@@ -271,7 +267,7 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 ```
 
-Save it as `/etc/systemd/system/chat_server.service`, then run `systemctl enable --now chat_server`. `foreground` fits because systemd wants a process that stays attached, and it collects stdout in the journal. `LimitNOFILE` raises the open file limit, because every connection uses one file descriptor.
+Save it as `/etc/systemd/system/chat_server.service`, then run `systemctl enable --now chat_server`. systemd wants a process that stays attached and collects its stdout in the journal, so `foreground` fits. `LimitNOFILE` raises the open file limit, because every connection uses one file descriptor.
 
 ## Exercises
 
@@ -311,17 +307,6 @@ Use `sys.config.src` and `vm.args.src` with `${PORT}` and `${NODE_NAME}`. Unpack
 % $ PORT=8081 NODE_NAME=chat_b@localhost COOKIE=abc bin/chat_server daemon
 % Expected: both answer pong when ping gets the same variables
 % Expected: http://localhost:8080 and http://localhost:8081 both serve the client
-```
-
-**Exercise 4: Version Bump**
-
-Change `vsn` in the app file and the version in the `release` tuple to `"0.2.0"`. Build a new tarball.
-
-```erlang
-% $ bin/chat_server versions
-% Expected:
-% Installed versions:
-% * 0.2.0	permanent
 ```
 
 ## Key Takeaways
@@ -385,14 +370,6 @@ Change `vsn` in the app file and the version in the `release` tuple to `"0.2.0"`
       answer: "prod",
       hint: "The name after 'as' on the command line selects the profile.",
       explanation: "rebar3 as prod merges the prod profile over the top-level config, so the release gets real copies and its own ERTS."
-    },
-    {
-      id: "l25_child_spec_port",
-      question: "The supervisor reads the port when it builds the child spec. What ends up in the start arguments?",
-      code: "child() ->\n    Port = application:get_env(chat_server, listen_port, 8080),\n    #{id => chat_listener, start => {chat_listener, start_link, [Port]}}.\n\napplication:set_env(chat_server, listen_port, 8081).\n#{start := {_, _, Args}} = child().\nArgs.\n% => [___]",
-      answer: "8081",
-      hint: "The environment was set before child() ran.",
-      explanation: "The child spec is built at supervisor start, after sys.config has been loaded, so the listener gets the configured port."
     }
   ]}
 />

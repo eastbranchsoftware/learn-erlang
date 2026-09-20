@@ -133,7 +133,7 @@ ok
 
 ## Timeouts Belong to States
 
-"Drop clients that do not log in within 30 seconds" is awkward in a gen_server. We would have to start a timer with `erlang:send_after/3`, keep the reference, cancel it on login, and ignore a timeout message that was already in the mailbox.
+"Drop clients that do not log in within 30 seconds" is awkward in a gen_server. We would start a timer with `erlang:send_after/3`, keep the reference, cancel it on login, and ignore a timeout message that was already in the mailbox.
 
 The action `{state_timeout, Ms, Content}` does all of that. It delivers the event `(state_timeout, Content, Data)` after `Ms` milliseconds in the current state. When the state changes, gen_statem cancels the timer. The session above logged in, so its timer never fired. Start one with a short timeout and leave it alone.
 

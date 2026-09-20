@@ -1,0 +1,400 @@
+---
+title: "Event Handling with gen_event"
+description: "Publish chat events through a gen_event manager so statistics, moderation and tracing plug in without touching the core modules"
+postNumber: 38
+publishDate: 2026-09-19T00:00:00Z
+tags: ["advanced", "otp", "gen_event"]
+difficulty: "advanced"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+The last behaviour from the list in lesson 11 is `gen_event`. It solves a problem our code already has. `chat_connection` calls `chat_stats` directly, several modules call the logger, and moderation and webhooks are next. Every new concern edits the core modules. An event manager inverts that. The core says "this happened" once, and anyone who cares installs a handler.
+
+## One Process, Many Handlers
+
+`gen_event:start_link/1` starts an **event manager**. The manager is one process that holds a list of **handlers**. A handler is a callback module plus its own state. `gen_event:notify/2` sends an event to the manager, and the manager calls `handle_event/2` of every handler, one after the other.
+
+Handlers are not processes. They run inside the manager process, and that one fact explains how gen_event behaves.
+
+- A slow handler delays every handler behind it and every later event.
+- The manager wraps each callback in a `catch`. A handler that crashes is removed from the list. The manager and the other handlers carry on, and nothing restarts the handler.
+- `self()` inside a handler is the manager.
+
+**Create `src/chat_events.erl`:**
+
+```erlang
+-module(chat_events).
+
+-export([start_link/0, notify/1]).
+
+start_link() ->
+    gen_event:start_link({local, ?MODULE}).
+
+notify(Event) ->
+    gen_event:notify(?MODULE, Event).
+```
+
+`notify/2` is asynchronous like a cast and returns `ok` even when no handler is installed. `gen_event:sync_notify/2` returns after every handler has seen the event. That makes the caller wait for the slowest handler, so the core uses `notify/2`.
+
+## Handlers
+
+A handler implements `init/1`, `handle_event/2` and `handle_call/2`. `handle_info/2` and `terminate/2` are optional. The first handler counts events. It feeds `chat_stats` and keeps its own counts, because a handler has state.
+
+**Create `src/chat_stats_handler.erl`:**
+
+```erlang
+-module(chat_stats_handler).
+-behaviour(gen_event).
+
+-export([init/1, handle_event/2, handle_call/2]).
+
+init([]) ->
+    {ok, #{}}.
+
+handle_event(Event, Counts) ->
+    Counter = counter(element(1, Event)),
+    chat_stats:increment(Counter),
+    {ok, Counts#{Counter => maps:get(Counter, Counts, 0) + 1}}.
+
+handle_call(counts, Counts) ->
+    {ok, Counts, Counts}.
+
+counter(message) -> messages;
+counter(user_joined) -> joins;
+counter(user_left) -> leaves;
+counter(login_failed) -> failed_logins;
+counter(_Other) -> other_events.
+```
+
+`handle_event/2` returns `{ok, NewState}`. `handle_call/2` answers `gen_event:call(Manager, Handler, Request)` with `{ok, Reply, NewState}`. There is no `From`, because the manager sends the reply.
+
+The moderation handler gets a word list through `init/1`. It flags matching messages and keeps the last 20.
+
+**Create `src/chat_moderation_handler.erl`:**
+
+```erlang
+-module(chat_moderation_handler).
+-behaviour(gen_event).
+
+-export([init/1, handle_event/2, handle_call/2, terminate/2]).
+
+-define(KEEP, 20).
+
+init(Words) ->
+    {ok, #{words => Words, flagged => []}}.
+
+handle_event({message, Room, From, Text}, #{words := Words, flagged := Flagged} = State) ->
+    case binary:match(string:lowercase(Text), Words) of
+        nomatch ->
+            {ok, State};
+        _Found ->
+            logger:warning(#{event => flagged_message, room => Room, from => From}),
+            Entry = {Room, From, Text},
+            {ok, State#{flagged := lists:sublist([Entry | Flagged], ?KEEP)}}
+    end;
+handle_event(_Event, State) ->
+    {ok, State}.
+
+handle_call(flagged, #{flagged := Flagged} = State) ->
+    {ok, Flagged, State}.
+
+terminate(_Reason, #{flagged := Flagged}) ->
+    logger:notice(#{event => moderation_stopped, flagged => length(Flagged)}),
+    ok.
+```
+
+Every handler sees every event, so each needs a catch-all clause. `terminate/2` runs when the handler is deleted, when it crashes and when the manager stops.
+
+The third handler writes events to `logger` as structured reports (lesson 26). Its state is the log level.
+
+**Create `src/chat_log_handler.erl`:**
+
+```erlang
+-module(chat_log_handler).
+-behaviour(gen_event).
+
+-export([init/1, handle_event/2, handle_call/2]).
+
+init(Level) ->
+    {ok, Level}.
+
+handle_event({message, Room, From, Text}, Level) ->
+    logger:log(Level, #{event => message, room => Room, from => From, text => Text}),
+    {ok, Level};
+handle_event({login_failed, Username}, Level) ->
+    logger:warning(#{event => login_failed, username => Username}),
+    {ok, Level};
+handle_event(Event, Level) ->
+    logger:log(Level, #{event => Event}),
+    {ok, Level}.
+
+handle_call(_Request, Level) ->
+    {ok, ok, Level}.
+```
+
+## Installing Handlers Under Supervision
+
+`gen_event:add_handler/3` installs a handler, and if that handler crashes later it is gone for good. `gen_event:add_sup_handler/3` also links the manager and the calling process. When the handler is removed, the caller gets `{gen_event_EXIT, Handler, Reason}`. The reason is `normal` for a delete, `shutdown` when the manager stops, and the error for a crash. When the caller dies, the manager deletes the handler. We'll give that job to a small gen_server.
+
+**Create `src/chat_events_guard.erl`:**
+
+```erlang
+-module(chat_events_guard).
+-behaviour(gen_server).
+
+-export([start_link/0]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+init([]) ->
+    Handlers = #{
+        chat_stats_handler => [],
+        chat_moderation_handler => [<<"spam">>, <<"casino">>]
+    },
+    maps:foreach(fun install/2, Handlers),
+    {ok, Handlers}.
+
+handle_call(_Request, _From, Handlers) ->
+    {reply, ok, Handlers}.
+
+handle_cast(_Msg, Handlers) ->
+    {noreply, Handlers}.
+
+handle_info({gen_event_EXIT, _Handler, Reason}, Handlers)
+  when Reason =:= normal; Reason =:= shutdown ->
+    {noreply, Handlers};
+handle_info({gen_event_EXIT, Handler, _Crash}, Handlers) ->
+    logger:error(#{event => handler_reinstalled, handler => Handler}),
+    install(Handler, maps:get(Handler, Handlers)),
+    {noreply, Handlers};
+handle_info(_Msg, Handlers) ->
+    {noreply, Handlers}.
+
+install(Handler, Args) ->
+    ok = gen_event:add_sup_handler(chat_events, Handler, Args).
+```
+
+The guard installs a crashed handler again with a fresh state. The alternative is to return `{stop, Reason, Handlers}` and let the supervisor's restart intensity decide. That is stricter, and a moderation bug could then take the whole application down.
+
+**Update `src/chat_server_sup.erl`.** Add two children right after `chat_stats`, before anything that publishes events.
+
+```erlang
+%% In src/chat_server_sup.erl
+        #{id => chat_events, start => {chat_events, start_link, []},
+          modules => dynamic},
+        #{id => chat_events_guard, start => {chat_events_guard, start_link, []}},
+```
+
+`modules => dynamic` tells release upgrades (lesson 33) that the set of callback modules changes at runtime. If the manager dies, the link takes the guard with it, and the supervisor restarts both in order.
+
+## Publishing Events
+
+The core changes are one line each. In `chat_room`, bind `name := Name` in the heads of the join and leave clauses.
+
+```erlang
+%% In src/chat_room.erl, handle_call/3
+            notify(system_event(Username, <<" joined">>, State), NewState),
+            chat_events:notify({user_joined, Name, Username}),
+
+            notify(system_event(Username, <<" left">>, State), NewState),
+            chat_events:notify({user_left, Name, Username}),
+
+            notify(Event, State),
+            chat_events:notify({message, Name, Sender, Text}),
+```
+
+In `chat_connection`, the failed login publishes an event. Delete the call `chat_stats:increment(messages)` in the `message` clause, because the stats handler counts messages now.
+
+```erlang
+%% In src/chat_connection.erl, the login clause of handle_message/2
+        {error, Reason} ->
+            chat_events:notify({login_failed, Name}),
+            send_error(Reason, State)
+```
+
+Start `rebar3 as test shell` so `ws_client` from lesson 24 is available. Alice registers, fails one login, logs in and sends two messages.
+
+```erlang
+1> gen_event:which_handlers(chat_events).
+[chat_stats_handler,chat_moderation_handler]
+2> {ok, A} = ws_client:connect(8080).
+{ok,#Port<0.4>}
+3> ws_client:send_json(A, #{type => register, username => <<"alice">>, password => <<"correct horse">>}).
+ok
+4> ws_client:send_json(A, #{type => login, username => <<"alice">>, password => <<"wrong horse">>}).
+ok
+5> ws_client:send_json(A, #{type => login, username => <<"alice">>, password => <<"correct horse">>}).
+ok
+6> ws_client:send_json(A, #{type => message, room => <<"lobby">>, text => <<"hello">>}).
+ok
+7> ws_client:send_json(A, #{type => message, room => <<"lobby">>, text => <<"Visit my CASINO today">>}).
+ok
+=WARNING REPORT==== 19-Sep-2026::11:03:58.219135 ===
+    event: flagged_message
+    from: <<"alice">>
+    room: <<"lobby">>
+8> gen_event:call(chat_events, chat_stats_handler, counts).
+#{messages => 2,joins => 1,failed_logins => 1}
+9> gen_event:call(chat_events, chat_moderation_handler, flagged).
+[{<<"lobby">>,<<"alice">>,<<"Visit my CASINO today">>}]
+```
+
+## Handlers at Runtime
+
+Handlers come and go while the system runs. The log handler is not installed by the guard. We add it when we want to see every event in production, and delete it five minutes later.
+
+```erlang
+10> gen_event:add_handler(chat_events, chat_log_handler, notice).
+ok
+11> ws_client:send_json(A, #{type => message, room => <<"lobby">>, text => <<"anyone here?">>}).
+ok
+=NOTICE REPORT==== 19-Sep-2026::11:03:58.607353 ===
+    text: <<"anyone here?">>
+    event: message
+    from: <<"alice">>
+    room: <<"lobby">>
+12> gen_event:delete_handler(chat_events, chat_log_handler, []).
+ok
+13> gen_event:which_handlers(chat_events).
+[chat_stats_handler,chat_moderation_handler]
+```
+
+The third argument of `delete_handler/3` goes to `terminate/2`. `gen_event:swap_handler/3` replaces one handler with another in one step, and the new `init/1` receives what the old `terminate/2` returned. A module can be installed twice under an id such as `{chat_moderation_handler, plain}`.
+
+## A Handler Crashes
+
+Install a second moderation handler with plain `add_handler/3`, then publish a broken event. The text is an atom, so `string:lowercase/1` fails in both moderation handlers. The reports are shortened.
+
+```erlang
+14> gen_event:add_handler(chat_events, {chat_moderation_handler, plain}, [<<"spam">>]).
+ok
+15> gen_event:which_handlers(chat_events).
+[{chat_moderation_handler,plain},
+ chat_stats_handler,chat_moderation_handler]
+16> chat_events:notify({message, <<"lobby">>, <<"alice">>, not_a_binary}).
+ok
+=ERROR REPORT==== 19-Sep-2026::11:03:58.625116 ===
+** gen_event handler {chat_moderation_handler,plain} crashed.
+** Was installed in chat_events
+** Last event was: {message,<<"lobby">>,<<"alice">>,not_a_binary}
+...
+=ERROR REPORT==== 19-Sep-2026::11:03:58.625325 ===
+    handler: chat_moderation_handler
+    event: handler_reinstalled
+17> gen_event:which_handlers(chat_events).
+[chat_moderation_handler,chat_stats_handler]
+18> gen_event:call(chat_events, chat_moderation_handler, flagged).
+[]
+```
+
+The plain handler vanished. Only a log line marks it, and moderation would stay off until someone noticed. The guarded handler is back at the front of the list with an empty state. The manager and the chat never stopped.
+
+## Where gen_event Fits
+
+`logger` follows the same idea. Its handlers are callback modules added and removed at runtime with `logger:add_handler/3`, and the file handler from lesson 26 is one of them.
+
+Use gen_event when handlers are cheap, optional and change at runtime. Keep blocking work out of the manager. The webhook handler in lesson 39 makes HTTP requests, so its `handle_event/2` should only pass the event to a worker process. When subscribers must be isolated processes, use `pg` from lesson 31.
+
+## Exercises
+
+**Exercise 1: Tracing That Expires**
+
+Give `chat_log_handler` an `init/1` clause for `{Level, Minutes}` that calls `erlang:send_after/3` with `self()`. Handle the message in `handle_info/2` and return `remove_handler`.
+
+```erlang
+% The message goes to the manager, which passes it to handle_info/2 of every handler.
+% Expected:
+% gen_event:add_handler(chat_events, chat_log_handler, {notice, 5}).
+% five minutes later:
+% gen_event:which_handlers(chat_events).
+% => [chat_stats_handler,chat_moderation_handler]
+```
+
+**Exercise 2: Disconnects**
+
+The `'DOWN'` clause of `chat_room` removes a member without an event. Find the username for the monitor reference and publish `{user_left, Name, Username}`.
+
+```erlang
+% Expected after a client closes its socket:
+% gen_event:call(chat_events, chat_stats_handler, counts).
+% => #{joins => 1,leaves => 1}
+```
+
+**Exercise 3: A Strict Guard**
+
+Change the crash clause of `chat_events_guard` to return `{stop, {handler_crashed, Handler}, Handlers}`. Publish the broken event and watch the supervisor restart the guard.
+
+```erlang
+% Expected after the crash:
+% gen_event:which_handlers(chat_events).
+% => [chat_stats_handler,chat_moderation_handler]
+% Both handlers are new. Why did the stats handler lose its counts too?
+```
+
+## Key Takeaways
+
+- **The manager is one process** and handlers are callback modules with state that run inside it
+- **`notify/2` is asynchronous** and returns `ok` whether or not a handler is installed. `sync_notify/2` waits for all handlers
+- **A crashing handler is removed** and everything else carries on. Nothing restarts it
+- **`add_sup_handler/3`** links the installer to the manager and delivers `{gen_event_EXIT, Handler, Reason}`, so a supervised guard can install the handler again
+- **`handle_event/2`** returns `{ok, State}` or `remove_handler`. **`handle_call/2`** returns `{ok, Reply, State}`
+- **Handlers change at runtime** with `add_handler/3`, `delete_handler/3` and `swap_handler/3`
+- **Slow work** belongs in another process, because a slow handler delays every event
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l38_notify_no_handlers",
+      question: "What does notify/2 return when no handler is installed?",
+      code: "{ok, M} = gen_event:start_link().\ngen_event:notify(M, {user_joined, <<\"lobby\">>, <<\"alice\">>}).\n% => ___",
+      answer: "ok",
+      hint: "The publisher does not know who listens.",
+      explanation: "notify/2 is asynchronous and always returns ok. The manager drops an event nobody handles."
+    },
+    {
+      id: "l38_handle_event_return",
+      question: "Which atom starts the return value that keeps the handler installed?",
+      code: "init(Count) ->\n    {ok, Count}.\n\nhandle_event(_Event, Count) ->\n    {___, Count + 1}.\n\nhandle_call(count, Count) ->\n    {ok, Count, Count}.\n\n{ok, M} = gen_event:start_link().\ngen_event:add_handler(M, ?MODULE, 0).\ngen_event:sync_notify(M, {message, <<\"lobby\">>, <<\"alice\">>, <<\"hi\">>}).\ngen_event:sync_notify(M, {user_left, <<\"lobby\">>, <<\"alice\">>}).\ngen_event:call(M, ?MODULE, count).\n% => 2",
+      answer: "ok",
+      hint: "It is the same atom init/1 uses.",
+      explanation: "handle_event/2 returns {ok, NewState}. The handler counted both events."
+    },
+    {
+      id: "l38_call_handler",
+      question: "Which gen_event function sends a request to one handler and returns its reply?",
+      code: "init(Words) ->\n    {ok, Words}.\n\nhandle_event(_Event, Words) ->\n    {ok, Words}.\n\nhandle_call(words, Words) ->\n    {ok, Words, Words}.\n\n{ok, M} = gen_event:start_link().\ngen_event:add_handler(M, ?MODULE, [spam]).\ngen_event:___(M, ?MODULE, words).\n% => [spam]",
+      answer: "call",
+      hint: "gen_server has a function of the same name.",
+      explanation: "gen_event:call/3 names the manager and the handler. handle_call/2 returns {ok, Reply, State}."
+    },
+    {
+      id: "l38_remove_handler",
+      question: "Which return value makes the handler remove itself?",
+      code: "init([]) ->\n    {ok, []}.\n\nhandle_event(stop_tracing, _State) ->\n    ___;\nhandle_event(_Event, State) ->\n    {ok, State}.\n\nhandle_call(_Request, State) ->\n    {ok, ok, State}.\n\n{ok, M} = gen_event:start_link().\ngen_event:add_handler(M, ?MODULE, []).\ngen_event:sync_notify(M, stop_tracing).\ngen_event:which_handlers(M).\n% => []",
+      answer: "remove_handler",
+      hint: "The atom says what happens.",
+      explanation: "Returning remove_handler from handle_event/2 uninstalls the handler without a crash report."
+    },
+    {
+      id: "l38_crash_removes_handler",
+      question: "The handler crashes on the event. What does the next expression return?",
+      code: "init([]) ->\n    {ok, []}.\n\nhandle_event({message, _Room, _From, Text}, State) ->\n    {ok, [byte_size(Text) | State]}.\n\nhandle_call(_Request, State) ->\n    {ok, ok, State}.\n\n{ok, M} = gen_event:start_link().\ngen_event:add_handler(M, ?MODULE, []).\ngen_event:sync_notify(M, {message, <<\"lobby\">>, <<\"alice\">>, not_a_binary}).\nis_process_alive(M).\n% => ___",
+      answer: "true",
+      hint: "The manager catches errors in handler callbacks.",
+      explanation: "A crashing handler is removed from the list. The manager process survives."
+    },
+    {
+      id: "l38_sup_handler_exit",
+      question: "Which function installs the handler so that this process is told about the crash?",
+      code: "init([]) ->\n    {ok, []}.\n\nhandle_event(_Event, _State) ->\n    error(handler_bug).\n\nhandle_call(_Request, State) ->\n    {ok, ok, State}.\n\n{ok, M} = gen_event:start_link().\ngen_event:___(M, ?MODULE, []).\ngen_event:notify(M, anything).\nreceive {gen_event_EXIT, _Handler, _Reason} -> told after 1000 -> timeout end.\n% => told",
+      answer: "add_sup_handler",
+      hint: "It supervises the connection between handler and caller.",
+      explanation: "add_sup_handler/3 links the caller and the manager. The caller gets a gen_event_EXIT message when the handler is removed."
+    }
+  ]}
+/>

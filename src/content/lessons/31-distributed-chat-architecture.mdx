@@ -1,0 +1,298 @@
+---
+title: "Distributed Chat Architecture"
+description: "Make chat rooms span nodes with process groups, so users connected to different servers can talk to each other"
+postNumber: 31
+publishDate: 2026-09-19T00:00:00Z
+tags: ["advanced", "distributed", "pg"]
+difficulty: "advanced"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+Lesson 30 left us with two connected nodes that ignore each other. Put them behind a load balancer and the chat breaks. Alice lands on node `a`, Bob on node `b`, both join `lobby`, and neither sees the other. Each node has its own `chat_rooms` manager, so each node started its own `lobby` process with its own member list.
+
+## Two Ways to Share a Room
+
+**One process per room for the whole cluster.** Register the room with `global`, the cluster-wide name registry, and let every node send to that one process. The code barely changes, but every message from every node crosses the network to one process, even when sender and receiver sit on the same node. When the node that hosts the room dies, the room dies for everybody.
+
+**One process per room per node.** Each node keeps the local `chat_room` it already has. A room delivers a message to its local members and forwards one copy to the same room on every other node. A node failure removes only that node's members. We'll build this one. Phoenix PubSub in the Elixir world works the same way. It needs one thing. A room must find its peers on other nodes.
+
+## Process Groups
+
+`pg` keeps named groups of processes. A group name is any term, a process can join many groups, and every node sees the members from all connected nodes. Groups live in a scope, which is a process that owns the membership tables. Try it in a plain `erl` shell.
+
+```erlang
+1> {ok, _} = pg:start_link(demo).
+{ok,<0.86.0>}
+2> Pid = spawn(fun() -> receive stop -> ok end end).
+<0.88.0>
+3> pg:join(demo, {room, <<"lobby">>}, Pid).
+ok
+4> pg:join(demo, {room, <<"lobby">>}, self()).
+ok
+5> pg:get_members(demo, {room, <<"lobby">>}).
+[<0.84.0>,<0.88.0>]
+6> Pid ! stop.
+stop
+7> pg:get_members(demo, {room, <<"lobby">>}) =:= [self()].
+true
+```
+
+Nobody removed `Pid` from the group. The scope monitors every member and drops it when it exits. An unknown group is an empty list, not an error.
+
+Across nodes, scope processes with the same name find each other and exchange their local members. When a node goes down, its members vanish from every other node's view. There is no central table and no lock, so membership is eventually consistent. A process that joined a millisecond ago on node `b` may not be visible on node `a` yet. A message sent in that instant misses the new room, which chat can accept.
+
+`pg:get_members/2` returns members on all nodes. `pg:get_local_members/2` returns only those on this node.
+
+## Starting the Scope
+
+The scope is a process, so it belongs in the supervision tree. The child spec points at `pg:start_link/1`.
+
+**Update `src/chat_server_sup.erl`:**
+
+```erlang
+%% In src/chat_server_sup.erl, add to the Children list before chat_room_sup
+        #{id => pg_chat, start => {pg, start_link, [chat]}},
+```
+
+Rooms join the scope in `init/1`, so it must start before them. With the port from lesson 25 and `chat_cluster` from lesson 30 in the same tree, two nodes can run on one machine.
+
+## Rooms That Forward
+
+**Update `src/chat_room.erl`:**
+
+```erlang
+%% In src/chat_room.erl
+init(Name) ->
+    ok = pg:join(chat, {room, Name}, self()),
+    {ok, #{name => Name, members => #{}, history => []}}.
+
+%% Replace the message clause of handle_call/3.
+handle_call({message, Sender, Text}, _From, #{name := Name, members := Members} = State) ->
+    case maps:is_key(Sender, Members) of
+        true ->
+            Event = #{type => message, room => Name, from => Sender, text => Text},
+            publish(Event, State),
+            {reply, ok, remember(Event, State)};
+        false ->
+            {reply, {error, not_member}, State}
+    end;
+
+%% Add above the catch-all clause of handle_info/2.
+handle_info({remote_message, Event}, State) ->
+    notify(Event, State),
+    {noreply, remember(Event, State)};
+
+%% Add to the internal functions.
+%% Local members first, then the same room on every other node.
+publish(Event, #{name := Name} = State) ->
+    notify(Event, State),
+    Group = {room, Name},
+    Remote = pg:get_members(chat, Group) -- pg:get_local_members(chat, Group),
+    [Pid ! {remote_message, Event} || Pid <- Remote],
+    ok.
+
+remember(#{type := message} = Event, #{history := History} = State) ->
+    State#{history := lists:sublist([Event | History], ?HISTORY_SIZE)};
+remember(_Event, State) ->
+    State.
+```
+
+If lesson 28 made your `init/1` load history from `chat_store`, keep that line and add the `pg:join/3` call above it. In the `join` and `leave` clauses, replace `notify(` with `publish(` so that `alice joined` reaches the other nodes as well.
+
+A room on node `a` and a room on node `b` with the same name are now in the same group. `publish/2` subtracts the local members from all members, which leaves the peers. Pids work across nodes, so forwarding is a plain send.
+
+**The receiving side must not publish.** `handle_info/2` calls `notify/2` and `remember/2` only. Picture it calling `publish/2` instead. Room `a` forwards to room `b`, room `b` forwards back to room `a`, and one message circles between the nodes forever. Only the node where a message entered the cluster forwards it. The same goes for storage. If your room saves messages with `chat_store:save_message/3`, only the `handle_call` clause saves, so each message is written once.
+
+**A room exists only where it has users.** If nobody on node `b` joined `erlang`, there is no group member on `b` and nothing is sent there.
+
+**Ordering is per sender.** Erlang guarantees that messages between two processes arrive in the order they were sent. Everything Alice writes passes through room `a` and reaches room `b` in order. There is no order between senders on different nodes. If Alice and Bob write in the same instant, node `a` may show Alice first while node `b` shows Bob first. A global order would need one process that sequences everything, which is the first design again.
+
+## Who Is Here
+
+`members/1` still answers for one node. For the whole cluster, ask every room in the group.
+
+```erlang
+%% In src/chat_room.erl, export all_members/1
+all_members(Room) ->
+    Pids = pg:get_members(chat, {room, Room}),
+    lists:usort(lists:append([gen_server:call(Pid, members) || Pid <- Pids])).
+```
+
+`gen_server:call/2` works with a remote pid. Call it from outside a room only. Two rooms that call each other at the same moment would both wait until the timeout.
+
+## One Login per Cluster
+
+`chat_registry` rejects a second login of the same user, but only on its own node. Alice could be online twice, once per node. `global:register_name/2` registers a name on all connected nodes under a cluster-wide lock. It returns `yes` or `no`, and it removes the name when the process dies.
+
+**Update `src/chat_connection.erl`:**
+
+```erlang
+%% In src/chat_connection.erl
+enter_chat(Name, Token, State) ->
+    case global:register_name({user, Name}, self()) =:= yes
+         andalso chat_registry:register_user(Name, self()) of
+        ok ->
+            send_event(#{type => login_ok, username => Name, token => Token}, State),
+            join_room(<<"lobby">>, State#state{username = Name});
+        _Taken ->
+            send_error(already_online, State)
+    end.
+```
+
+The lock makes `global` slow compared to `pg`, so use it for rare events like a login, not for every message. `global:whereis_name/1` finds a user's connection from any node.
+
+## Two Nodes, One Lobby
+
+Start both nodes as in lesson 30.
+
+```bash
+rebar3 shell --sname a@localhost --setcookie chat --config config/a.config
+rebar3 shell --sname b@localhost --setcookie chat --config config/b.config
+```
+
+The transcripts below come from a run with one scripted WebSocket client per node, Alice on port 8080 and Bob on 8081. Two browser tabs show the same thing. Accounts still live on one node each, so register Alice on `a` and Bob on `b`.
+
+After both logins, node `a` sees two `lobby` processes, one of them remote.
+
+```erlang
+(a@localhost)8> pg:get_members(chat, {room, <<"lobby">>}).
+[<7545.118.0>,<0.119.0>]
+(a@localhost)9> pg:get_local_members(chat, {room, <<"lobby">>}).
+[<0.119.0>]
+```
+
+Alice's client received the notice about Bob, who joined on the other node. Then each of them wrote one message. This is what arrived on Alice's socket.
+
+```json
+{"type":"system","room":"lobby","text":"bob joined"}
+{"type":"message","room":"lobby","from":"alice","text":"hello from node a"}
+{"type":"message","room":"lobby","from":"bob","text":"hello from node b"}
+```
+
+Bob's socket on node `b` received both messages too.
+
+```erlang
+(a@localhost)13> chat_room:members(<<"lobby">>).
+[<<"alice">>]
+(a@localhost)14> chat_room:all_members(<<"lobby">>).
+[<<"alice">>,<<"bob">>]
+(a@localhost)15> global:whereis_name({user, <<"bob">>}).
+<7545.113.0>
+```
+
+A second login as `alice` on node `b` got `{"type":"error","reason":"already_online"}`. Then we stopped node `b` with `halt().`
+
+```erlang
+(a@localhost)17> chat_room:all_members(<<"lobby">>).
+[<<"alice">>]
+(a@localhost)18> pg:get_members(chat, {room, <<"lobby">>}).
+[<0.119.0>]
+```
+
+`pg` removed the remote room without any code from us. But nobody told Alice that Bob is gone, because `chat_registry:broadcast/1` announces a disconnect only on its own node.
+
+## Exercises
+
+**Exercise 1: Cluster-wide disconnect notice**
+
+Let `chat_registry` join a group `registry` in `init/1` and forward the `disconnected` event to the registries on other nodes.
+
+```erlang
+handle_info({remote_broadcast, Event}, State) ->
+    % Deliver to local users only. Do not forward again.
+    {noreply, State}.
+
+% Expected on node a after bob's tab on node b closes:
+% {"type":"system","text":"bob disconnected"}
+```
+
+**Exercise 2: Members over the wire**
+
+Make `all_members/1` survive a room that dies during the call.
+
+```erlang
+safe_members(Pid) ->
+    try gen_server:call(Pid, members, 2000)
+    catch exit:_ -> []
+    end.
+
+% Expected: all_members/1 returns the members of the rooms that answered
+```
+
+**Exercise 3: Rooms on every node**
+
+`chat_rooms:list_rooms/0` lists local rooms. Build a cluster-wide list from `pg:which_groups(chat)`.
+
+```erlang
+all_rooms() ->
+    lists:sort([Name || {room, Name} <- pg:which_groups(chat)]).
+
+% Expected on node a, after bob joined erlang on node b:
+% [<<"erlang">>, <<"lobby">>]
+```
+
+## Key Takeaways
+
+- **A room per node beats a room per cluster**. Local traffic stays local, and a dead node takes only its own users with it
+- **`pg` scopes are processes**. Start one with `#{id => pg_chat, start => {pg, start_link, [chat]}}` before the children that join it
+- **`pg:join/3` needs no cleanup**. Members disappear when their process or their node dies
+- **`get_members` minus `get_local_members`** is the list of peers on other nodes
+- **Forward once**. Only the node where a message entered publishes it. Receivers deliver locally, or the message loops forever
+- **Membership is eventually consistent** and ordering holds per sender only. Both are fine for chat
+- **`global:register_name/2`** gives a cluster-wide unique name at the price of a lock. Use it for logins, not for messages
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l31_peers_list_difference",
+      question: "Which pid is left after the local members are subtracted?",
+      code: "All = [room_a, room_b, room_c].\nLocal = [room_a].\n[First | _] = All -- Local.\nFirst.\n% => ___",
+      answer: "room_b",
+      hint: "The -- operator removes room_a and keeps the order of the rest.",
+      explanation: "publish/2 computes get_members -- get_local_members. What remains are the rooms on other nodes."
+    },
+    {
+      id: "l31_empty_group",
+      question: "Nobody joined this group. How many members does pg report?",
+      code: "{ok, _} = pg:start_link(l31_scope_empty).\nlength(pg:get_members(l31_scope_empty, {room, <<\"erlang\">>})).\n% => ___",
+      answer: "0",
+      hint: "An unknown group is not an error.",
+      explanation: "Groups exist only while they have members. Asking for an empty group returns the empty list."
+    },
+    {
+      id: "l31_join_function",
+      question: "Which pg function adds the calling process to the group?",
+      code: "{ok, _} = pg:start_link(l31_scope_join).\nok = pg:___(l31_scope_join, {room, <<\"lobby\">>}, self()).\npg:get_members(l31_scope_join, {room, <<\"lobby\">>}) =:= [self()].\n% => true",
+      answer: "join",
+      hint: "chat_room calls it in init/1 with the scope, the group and self().",
+      explanation: "pg:join(Scope, Group, Pid) adds a local process to a group. Every connected node with the same scope sees it."
+    },
+    {
+      id: "l31_scope_child_spec",
+      question: "Which module does the child spec for the chat scope start?",
+      code: "init([]) ->\n    Scope = #{id => pg_chat, start => {___, start_link, [chat]}},\n    {ok, {#{strategy => one_for_one}, [Scope]}}.",
+      answer: "pg",
+      hint: "The scope process comes with OTP. We wrote no module for it.",
+      explanation: "A child spec can start any module. {pg, start_link, [chat]} runs the scope named chat under our supervisor."
+    },
+    {
+      id: "l31_member_dies",
+      question: "The only member of the group exits. How many members are left?",
+      code: "wait_empty(_Scope, _Group, 0) -> gave_up;\nwait_empty(Scope, Group, Tries) ->\n    case pg:get_members(Scope, Group) of\n        [] -> 0;\n        _ -> timer:sleep(10), wait_empty(Scope, Group, Tries - 1)\n    end.\n\n{ok, _} = pg:start_link(l31_scope_dies).\n{Pid, Ref} = spawn_monitor(fun() -> receive stop -> ok end end).\nok = pg:join(l31_scope_dies, lobby, Pid).\nPid ! stop.\nreceive {'DOWN', Ref, process, Pid, _} -> ok after 1000 -> timeout end.\nwait_empty(l31_scope_dies, lobby, 100).\n% => ___",
+      answer: "0",
+      hint: "The scope monitors every member.",
+      explanation: "pg removes a member when its process exits. The same happens to all members of a node that goes down."
+    },
+    {
+      id: "l31_no_reforward",
+      question: "A room receives a message from another node. To how many peers does it forward it?",
+      code: "handle({local, Event}, Members, Peers) ->\n    [M ! {chat_event, Event} || M <- Members],\n    [P ! {remote_message, Event} || P <- Peers],\n    length(Peers);\nhandle({remote_message, Event}, Members, _Peers) ->\n    [M ! {chat_event, Event} || M <- Members],\n    0.\n\nhandle({remote_message, hello}, [self()], [self(), self()]).\n% => ___",
+      answer: "0",
+      hint: "Look at what the second clause does with the peers.",
+      explanation: "A forwarded message is delivered to local members only. Forwarding it again would bounce it between the nodes forever."
+    }
+  ]}
+/>

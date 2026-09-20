@@ -9,22 +9,20 @@ difficulty: "advanced"
 
 import ErlangKoans from '../../components/ErlangKoans.astro';
 
-The release from lesson 25 runs in the background, and that raises a new question. What is it doing right now? The few `io:format` calls we wrote cannot be filtered, carry no timestamp and say nothing about who connected. OTP ships a logging framework called `logger`, and the runtime can report on every process it runs.
+The release from lesson 25 runs in the background. What is it doing right now? Our few `io:format` calls cannot be filtered and carry no timestamp. OTP ships a logging framework called `logger`, and the runtime can report on every process it runs.
 
 ## Logger Basics
 
-`logger` has eight levels, from most to least severe: `emergency`, `alert`, `critical`, `error`, `warning`, `notice`, `info`, `debug`. The primary level decides what gets through. It defaults to `notice`, so `info` and `debug` events are dropped.
+`logger` has eight levels, from most to least severe: `emergency`, `alert`, `critical`, `error`, `warning`, `notice`, `info`, `debug`. The primary level decides what gets through. It defaults to `notice`, so `info` and `debug` events are dropped until you lower it.
 
 ```erlang
-1> logger:info("hidden").
+1> logger:set_primary_config(level, info).
 ok
-2> logger:set_primary_config(level, info).
-ok
-3> logger:info("room ~s has ~p members", [<<"lobby">>, 3]).
-=INFO REPORT==== 19-Sep-2026::10:58:12.104512 ===
+2> logger:info("room ~s has ~p members", [<<"lobby">>, 3]).
+=INFO REPORT==== 19-Sep-2026::15:16:41.186943 ===
 room lobby has 3 members
 ok
-4> logger:compare_levels(warning, info).
+3> logger:compare_levels(warning, info).
 gt
 ```
 
@@ -39,11 +37,11 @@ A log event can be a format string or a map, called a report.
 ?LOG_INFO(#{event => user_joined, user => Name, room => Room}),
 ```
 
-The first form is a sentence. To find every join in a room, something has to parse that sentence back apart. The report keeps the fields separate. A filter can match on `event`, a formatter can print key-value pairs or JSON, and a log shipper gets fields it can index. We'll use reports with an `event` key everywhere.
+The first form is a sentence that something has to parse apart again. The report keeps the fields separate. A filter can match on `event`, and a log shipper gets fields it can index. We'll use reports with an `event` key everywhere.
 
 ## Logging in the Chat Server
 
-Log what an operator needs to reconstruct later: connections opening and closing, failed logins, rooms being created, and messages a process did not expect. Do not log every chat message at `info`. That is a privacy problem and a volume problem.
+Log what an operator needs to reconstruct later: connections opening and closing, failed logins, rooms being created, and messages a process did not expect. Chat message text stays out of the log. It is private and there is a lot of it.
 
 **Update `src/chat_listener.erl`:** add the include below the `-behaviour` line and replace the `io:format` call in `init/1`.
 
@@ -51,17 +49,13 @@ Log what an operator needs to reconstruct later: connections opening and closing
 %% In src/chat_listener.erl
 -include_lib("kernel/include/logger.hrl").
 
-init(Port) ->
-    Options = [binary, {packet, raw}, {active, false}, {reuseaddr, true}],
-    {ok, ListenSocket} = gen_tcp:listen(Port, Options),
-    spawn_link(fun() -> accept_loop(ListenSocket) end),
+%% In init/1, in place of io:format
     ?LOG_NOTICE(#{event => listening, port => Port}),
-    {ok, ListenSocket}.
 ```
 
-The two `io:format` calls in `chat_stats` become `?LOG_WARNING` and `?LOG_NOTICE` reports in the same way. In `chat_room`, `init/1` gets `?LOG_INFO(#{event => room_created, room => Name})`.
+The two `io:format` calls in `chat_stats` become reports in the same way. In `chat_room`, `init/1` gets `?LOG_INFO(#{event => room_created, room => Name})`.
 
-The connection process is more interesting. Every line it logs should say which client it belongs to. Passing the address into each call is tedious. `logger:set_process_metadata/1` stores a map in the calling process, and `logger` merges it into every later event from that process.
+The connection process is more interesting. Every line it logs should say which client it belongs to. `logger:set_process_metadata/1` stores a map in the calling process, and `logger` merges it into every later event from that process.
 
 **Update `src/chat_connection.erl`:** add the same include, then change these functions.
 
@@ -91,26 +85,19 @@ terminate(Reason, #state{socket = Socket, phase = Phase}) ->
     gen_tcp:close(Socket).
 ```
 
-The `handle_info/2` clause shown is the final catch-all. It replaces the one that ignored the message. Plain HTTP requests for the page would double the log volume, so only WebSocket connections are logged. Add `?LOG_INFO(#{event => connection_open})` after `chat_stats:increment(connections)` in `handle_request/2`, and `?LOG_DEBUG(#{event => frame_in, frame => Frame})` before the `handle_frame/2` call in `process/1`.
+The `handle_info/2` clause shown replaces the final catch-all. Only WebSocket connections are logged, because page requests would double the volume. Add `?LOG_INFO(#{event => connection_open})` after `chat_stats:increment(connections)` in `handle_request/2`, and `?LOG_DEBUG(#{event => frame_in, frame => Frame})` before the `handle_frame/2` call in `process/1`.
 
 Once the username is known, add it to the metadata. A failed login is a `warning`, because a burst of them is an attack.
 
 ```erlang
 %% In src/chat_connection.erl, the login clause of handle_message/2
-    case chat_auth:login(Name, Password) of
-        {ok, Token} ->
-            enter_chat(Name, Token, State);
         {error, Reason} ->
             ?LOG_WARNING(#{event => login_failed, user => Name, reason => Reason}),
             send_error(Reason, State)
-    end;
 
-%% In enter_chat/3, the ok branch
-        ok ->
+%% In enter_chat/3, at the top of the ok branch
             logger:update_process_metadata(#{user => Name}),
             ?LOG_INFO(#{event => user_login}),
-            send_event(#{type => login_ok, username => Name, token => Token}, State),
-            join_room(<<"lobby">>, State#state{username = Name});
 ```
 
 ## Handler Configuration
@@ -150,21 +137,19 @@ Handlers decide where events go and formatters decide how they look. Both are co
 ].
 ```
 
-`logger_level` is the primary level. The `default` handler writes to the console. Its template prints `peer` and `user` only when the event carries them, which is what `{peer, [peer, " "], []}` means. The `progress` filter drops the "supervisor started child" reports that appear at `info`. The second handler writes `warning` and above to a file. When the file reaches 10 MB it rotates, and five old files are kept. We'll get to `metrics_interval` shortly.
+`logger_level` is the primary level. The `default` handler writes to the console, and its template prints `peer` and `user` only when the event carries them, which is what `{peer, [peer, " "], []}` means. The `progress` filter drops the "supervisor started child" reports at `info`. The second handler writes `warning` and above to a file. The file rotates at 10 MB and five old files are kept. `metrics_interval` comes up shortly.
 
-Here is a session with one failed login, a successful one, and a stray message sent to the connection process.
+Here is one failed login, a successful one, and a stray message sent to the connection process.
 
 ```text
 2026-09-19T10:58:45.781380-04:00 notice port: 8080, event: listening (chat_listener:init/1)
 2026-09-19T10:58:45.801408-04:00 info 127.0.0.1:51231 event: connection_open (chat_connection:handle_request/2)
 2026-09-19T10:58:45.804239-04:00 warning 127.0.0.1:51231 reason: invalid_credentials, user: <<"alice">>, event: login_failed (chat_connection:handle_message/2)
 2026-09-19T10:58:45.829172-04:00 info 127.0.0.1:51231 <<"alice">> event: user_login (chat_connection:enter_chat/3)
-2026-09-19T10:58:45.830212-04:00 info event: room_created, room: <<"lobby">> (chat_room:init/1)
 2026-09-19T10:58:46.434813-04:00 warning 127.0.0.1:51231 <<"alice">> message: hello, event: unexpected_message (chat_connection:handle_info/2)
-2026-09-19T10:58:57.452270-04:00 info 127.0.0.1:51231 <<"alice">> reason: normal, event: connection_closed (chat_connection:terminate/2)
 ```
 
-One line per event, and every connection line carries the peer without any call site passing it.
+Every connection line carries the peer, and no call site passed it.
 
 ## Reading a Crash Report
 
@@ -180,22 +165,20 @@ OTP behaviours log through `logger` too. We sent `chat_stats` a cast it has no c
        [{chat_stats,handle_cast,
             [{increment},#{messages => 1,connections => 1}],
             [{file,".../src/chat_stats.erl"},{line,40}]},
-        {gen_server,try_handle_cast,3,[{file,"gen_server.erl"},{line,2460}]},
+        ...
 2026-09-19T10:58:46.949555-04:00 error:
     supervisor: {local,chat_server_sup}
     errorContext: child_terminated
-    reason: {function_clause, ...
     offender: [{pid,<0.95.0>},
                {id,chat_stats},
-               {mfargs,{chat_stats,start_link,[]}},
-               {restart_type,permanent},
+               ...
 ```
 
-Read it in this order. "Last message in" is the input that killed the process. The first tuple of the stack trace is the function that failed, with the arguments it got and the line. "Server state" is the state at the time. The supervisor report that follows names the child in `offender`, and the restart follows at once.
+Read it in this order. "Last message in" is the input that killed the process. The first tuple of the stack trace is the function that failed, with the arguments it got and the line. "Server state" is the state at the time. The supervisor report names the restarted child in `offender`.
 
 ## Metrics
 
-Logs describe events. Metrics describe the system at one moment. Everything we need already exists in the running processes.
+Logs describe events. Metrics describe the system at one moment.
 
 **Create `src/chat_metrics.erl`:**
 
@@ -210,7 +193,7 @@ Logs describe events. Metrics describe the system at one moment. Everything we n
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
-%% Runs in the caller. Nothing here needs the chat_metrics process.
+%% Runs in the caller.
 snapshot() ->
     Stats = chat_stats:get_all(),
     Children = supervisor:count_children(chat_conn_sup),
@@ -222,8 +205,7 @@ snapshot() ->
       process_count => erlang:system_info(process_count),
       max_queue_len => max_queue_len()}.
 
-%% The N processes with the largest value of Item,
-%% where Item is message_queue_len, memory or reductions.
+%% The N processes with the largest message_queue_len, memory or reductions.
 top(Item, N) ->
     Values = [{Value, Pid} || Pid <- processes(),
                               {_, Value} <- [process_info(Pid, Item)]],
@@ -251,9 +233,9 @@ handle_info(_Msg, State) ->
     {noreply, State}.
 ```
 
-`connections` counts live children of `chat_conn_sup`, which includes page requests in flight. `memory` is the total in bytes. `process_info/2` returns `undefined` for a process that exited while we looped, and the generator pattern `{_, Value}` skips those. `max_queue_len` is the most useful number here. A healthy process has an empty mailbox almost all the time. A queue that grows means a process receives faster than it can handle, and memory follows.
+`connections` counts live children of `chat_conn_sup`. `process_info/2` returns `undefined` for a process that exited while we looped, and the generator pattern `{_, Value}` skips those. `max_queue_len` is the most useful number. A healthy mailbox is almost always empty. A queue that grows means a process receives faster than it can handle, and memory follows.
 
-The gen_server exists only for the timer. `timer:send_interval/2` sends `report` to the calling process every interval, and `handle_info/2` logs a snapshot with an `event` key added.
+The gen_server exists only for the timer. `timer:send_interval/2` sends it `report` every interval, and `handle_info/2` logs a snapshot.
 
 **Update `src/chat_server_sup.erl`:** add the child at the end of the list.
 
@@ -267,9 +249,7 @@ The gen_server exists only for the timer. `timer:send_interval/2` sends `report`
   users => 1,connections => 1,max_queue_len => 0,rooms => 1}
 ```
 
-```text
-2026-09-19T10:59:40.407629-04:00 info memory: 59934531, messages: 1, process_count: 81, users: 1, connections: 1, max_queue_len: 0, rooms: 1, event: metrics (chat_metrics:handle_info/2)
-```
+The periodic log line carries the same fields plus `event: metrics`.
 
 ## Finding a Misbehaving Process
 
@@ -289,7 +269,7 @@ When `max_queue_len` or memory climbs, open a remote console and look for the pr
 {state,#Port<0.5>,<<>>,websocket,<<"alice">>,[<<"lobby">>]}
 ```
 
-`current_function` shows where a process is stuck. `gen_server:loop/5` means idle and waiting. `reductions` counts work done, so two samples a second apart show who is busy. `sys:get_state/1` returns the state of any OTP process. It sends a system message, so it times out on a process that is blocked.
+`current_function` shows where a process is stuck. `gen_server:loop/5` means idle and waiting. `reductions` counts work done, so two samples show who is busy. `sys:get_state/1` returns the state of any OTP process. It times out on a process that is blocked.
 
 The same console can turn on debug logging for one module while the node runs.
 
@@ -306,7 +286,7 @@ Frames include login passwords, so switch it off again with `logger:unset_module
 
 ## Observer
 
-`observer:start()` opens a graphical tool with process lists sortable by memory and queue length, a view of the supervision tree, and load charts. A release on a server has no GUI, so run observer on your machine and connect it. The release needs the `runtime_tools` application for this.
+`observer:start()` opens a graphical tool with sortable process lists, the supervision tree and load charts. A release on a server has no GUI, so run observer on your machine and connect it. The release needs the `runtime_tools` application for this.
 
 ```erlang
 %% In rebar.config
@@ -321,10 +301,9 @@ $ erl -hidden -sname debug@localhost -setcookie change_me_in_production
 (debug@localhost)1> net_adm:ping(chat_server@localhost).
 pong
 (debug@localhost)2> observer:start().
-ok
 ```
 
-Pick `chat_server@localhost` in the Nodes menu. `-hidden` keeps the debug node out of the server's `nodes()` list, so code that iterates over cluster nodes (lesson 30) never sees it. For a terminal-only toolkit, the third-party library `recon` is what most production teams use. This series has no dependencies, so `chat_metrics:top/2` is our small version of it.
+Pick `chat_server@localhost` in the Nodes menu. `-hidden` keeps the debug node out of the server's `nodes()` list, so cluster code (lesson 30) never sees it. For a terminal-only toolkit, the third-party library `recon` is what most production teams use. `chat_metrics:top/2` is our small version of it.
 
 ## Exercises
 
@@ -347,8 +326,7 @@ handle_info({'DOWN', Ref, process, Pid, Reason}, Rooms) ->
 Add two keys to `chat_metrics:snapshot/0`.
 
 ```erlang
-% uptime_seconds: from erlang:statistics(wall_clock), which returns
-%   {MillisecondsSinceStart, MillisecondsSinceLastCall}
+% uptime_seconds: erlang:statistics(wall_clock) returns {TotalMs, SinceLastCallMs}
 % total_connections: the connections counter from chat_stats:get_all()
 % Expected: #{uptime_seconds => 42, total_connections => 3, ...}
 ```
@@ -358,20 +336,10 @@ Add two keys to `chat_metrics:snapshot/0`.
 Make `handle_info(report, State)` log a second event at `warning` when `max_queue_len` is above 1000.
 
 ```erlang
-% Build a victim: P = spawn(fun() -> receive stop -> ok end end).
-% Fill it: [P ! N || N <- lists:seq(1, 2000)].
+% P = spawn(fun() -> receive stop -> ok end end).
+% [P ! N || N <- lists:seq(1, 2000)].
 % Expected: chat_metrics:top(message_queue_len, 1) returns [{2000, P}]
 % Expected: the next report logs event: queue_alarm with the pid
-```
-
-**Exercise 4: Count Failed Logins**
-
-Call `chat_stats:increment(login_failures)` next to the `login_failed` log line and add the counter to the snapshot.
-
-```erlang
-% Expected after two bad passwords:
-% chat_stats:get(login_failures).
-% 2
 ```
 
 ## Key Takeaways
@@ -379,11 +347,10 @@ Call `chat_stats:increment(login_failures)` next to the `login_failed` log line 
 - **Use the `?LOG_*` macros** in modules. They skip disabled levels cheaply and record module, function and line
 - **Log maps, not sentences**. A report with an `event` key can be filtered, formatted and shipped without parsing text
 - **Process metadata** set once with `logger:set_process_metadata/1` appears on every later event from that process
-- **Handlers and formatters live in `sys.config`**, so console format, file rotation and levels change per deployment without touching code
+- **Handlers and formatters live in `sys.config`**, so format, rotation and levels change per deployment
 - **Crash reports have a fixed shape**. Read the last message, the top stack frame, then the state
 - **`message_queue_len` is the early warning**. A growing mailbox means a process cannot keep up
 - **`process_info/2` and `sys:get_state/1`** inspect any process on a live node, and `logger:set_module_level/2` turns on debug output for one module
-- **Attach observer through a hidden node** so the debugging session stays invisible to the cluster
 
 ## Interactive Koans
 
@@ -404,14 +371,6 @@ Call `chat_stats:increment(login_failures)` next to the `login_failed` log line 
       answer: "warning",
       hint: "get_primary_config/0 returns a map with a level key.",
       explanation: "The primary level is global and can be changed at runtime, for example from a remote console."
-    },
-    {
-      id: "l26_allow_info",
-      question: "With the primary level at warning, would an info event from chat_room be logged?",
-      code: "logger:set_primary_config(level, warning).\nlogger:allow(info, chat_room).\n% => ___",
-      answer: "false",
-      hint: "info is less severe than warning.",
-      explanation: "Events below the primary level are dropped before any handler sees them. The LOG macros make this same check."
     },
     {
       id: "l26_module_level",
@@ -444,14 +403,6 @@ Call `chat_stats:increment(login_failures)` next to the `login_failed` log line 
       answer: "conn_b",
       hint: "Tuples sort by their first element.",
       explanation: "Sorting {Value, Pid} tuples and reversing puts the largest value first, which is how chat_metrics:top/2 works."
-    },
-    {
-      id: "l26_failed_login_level",
-      question: "Which logger function fits a failed login, one step more severe than notice?",
-      code: "Name = <<\"alice\">>.\nlogger:___(#{event => login_failed, user => Name, reason => invalid_credentials}).",
-      answer: "warning",
-      hint: "The lesson logs auth failures at this level so the file handler keeps them.",
-      explanation: "Failed logins are not errors in our code, but a burst of them needs attention, so warning is the right level."
     }
   ]}
 />
