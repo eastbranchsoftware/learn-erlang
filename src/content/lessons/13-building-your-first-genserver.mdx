@@ -1,0 +1,305 @@
+---
+title: "Building Your First GenServer"
+description: "Design and build chat_registry, the gen_server that tracks which users are online and cleans up after processes that die"
+postNumber: 13
+publishDate: 2026-09-19T00:00:00Z
+tags: ["intermediate", "gen_server", "chat-server"]
+difficulty: "intermediate"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+`chat_stats` from lesson 12 showed the mechanics of `gen_server`. Now we'll design a server the chat system depends on. Every connected user will be a process, and other parts of the system need to find those processes by username. `chat_registry` is the process that knows who is online.
+
+## Design First
+
+Before writing callbacks, answer three questions. What does the server own, what can callers ask, and what can go wrong?
+
+**What it owns.** A mapping from username to the pid of that user's connection process. Usernames are binaries such as `<<"alice">>`, because they will arrive over the network as bytes.
+
+**What callers can ask.**
+
+| Function | Returns |
+| --- | --- |
+| `start_link()` | `{ok, Pid}` |
+| `register_user(Username, Pid)` | `ok` or `{error, username_taken}` |
+| `unregister_user(Username)` | `ok` |
+| `lookup(Username)` | `{ok, Pid}` or `{error, not_found}` |
+| `list_users()` | a list of usernames |
+
+**What can go wrong.** A user process can die without calling `unregister_user/1`. The browser tab closes, the network drops, or the process crashes. If the registry keeps the dead pid, the name stays taken forever. Asking every user process to clean up after itself cannot work, because a killed process runs no cleanup code.
+
+Lesson 10 had the tool for this. The registry monitors every pid it registers. When a user process dies for any reason, the registry receives a `'DOWN'` message and removes the entry itself.
+
+That decides the state. Each username maps to a tuple of pid and monitor reference. We keep the reference so we can cancel the monitor when a user unregisters.
+
+```erlang
+#{<<"alice">> => {<0.180.0>, #Ref<0.3223873074.1202978824.195053>},
+  <<"bob">>   => {<0.182.0>, #Ref<0.3223873074.1202978824.195064>}}
+```
+
+## The Implementation
+
+**Create `src/chat_registry.erl`:**
+
+```erlang
+-module(chat_registry).
+-behaviour(gen_server).
+
+%% Client API
+-export([start_link/0, register_user/2, unregister_user/1, lookup/1, list_users/0]).
+
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+
+%%% Client API
+
+-spec start_link() -> {ok, pid()} | {error, term()}.
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+-spec register_user(binary(), pid()) -> ok | {error, username_taken}.
+register_user(Username, Pid) ->
+    gen_server:call(?MODULE, {register, Username, Pid}).
+
+-spec unregister_user(binary()) -> ok.
+unregister_user(Username) ->
+    gen_server:call(?MODULE, {unregister, Username}).
+
+-spec lookup(binary()) -> {ok, pid()} | {error, not_found}.
+lookup(Username) ->
+    gen_server:call(?MODULE, {lookup, Username}).
+
+-spec list_users() -> [binary()].
+list_users() ->
+    gen_server:call(?MODULE, list_users).
+
+%%% Callbacks
+
+init([]) ->
+    {ok, #{}}.
+
+handle_call({register, Username, Pid}, _From, Users) ->
+    case maps:is_key(Username, Users) of
+        true ->
+            {reply, {error, username_taken}, Users};
+        false ->
+            Ref = monitor(process, Pid),
+            {reply, ok, Users#{Username => {Pid, Ref}}}
+    end;
+handle_call({unregister, Username}, _From, Users) ->
+    case maps:take(Username, Users) of
+        {{_Pid, Ref}, Rest} ->
+            demonitor(Ref, [flush]),
+            {reply, ok, Rest};
+        error ->
+            {reply, ok, Users}
+    end;
+handle_call({lookup, Username}, _From, Users) ->
+    case maps:find(Username, Users) of
+        {ok, {Pid, _Ref}} -> {reply, {ok, Pid}, Users};
+        error -> {reply, {error, not_found}, Users}
+    end;
+handle_call(list_users, _From, Users) ->
+    {reply, lists:sort(maps:keys(Users)), Users}.
+
+handle_cast(_Msg, Users) ->
+    {noreply, Users}.
+
+handle_info({'DOWN', Ref, process, _Pid, _Reason}, Users) ->
+    Remaining = maps:filter(fun(_Name, {_P, R}) -> R =/= Ref end, Users),
+    {noreply, Remaining};
+handle_info(_Msg, Users) ->
+    {noreply, Users}.
+```
+
+Some details are worth a closer look.
+
+**Every operation is a call.** `register_user/2` has to be a call because the caller needs to know whether the name was free. `unregister_user/1` could be a cast, but a call guarantees the name is free again when the function returns. A user who renames can unregister and register in two lines without a race.
+
+**`monitor/2` runs inside `handle_call/3`.** The process that calls `monitor` is the one that gets the `'DOWN'` message. The callback runs in the registry process, so the registry receives it. Calling `monitor` in `register_user/2` would monitor from the caller's process instead.
+
+**`maps:take/2`** returns the value and the map without the key, or `error` when the key is missing. Unregistering an unknown name returns `ok`, so callers can do it without checking first. `demonitor(Ref, [flush])` stops the monitor and removes a `'DOWN'` message that may already be queued.
+
+**The `'DOWN'` clause** only has a reference, not a username. `maps:filter/2` keeps every entry whose reference differs. This scans the whole map, which is fine for a few thousand users. Exercise 3 removes the scan.
+
+**`-spec` lines** document argument and return types. The compiler does not enforce them, but the `dialyzer` tool (lesson 36) checks them against the code. `handle_cast/2` is a required callback, so it gets a do-nothing clause.
+
+## Trying It Out
+
+Run `rebar3 shell` in the `erlang_chat` directory. The application does not start the registry yet, so start it by hand. We have no connections, so a fake user is a process that waits for `stop`.
+
+```erlang
+1> chat_registry:start_link().
+{ok,<0.177.0>}
+2> FakeUser = fun() -> spawn(fun() -> receive stop -> ok end end) end.
+#Fun<erl_eval.43.113135111>
+3> Alice = FakeUser().
+<0.180.0>
+4> Bob = FakeUser().
+<0.182.0>
+5> chat_registry:register_user(<<"alice">>, Alice).
+ok
+6> chat_registry:register_user(<<"bob">>, Bob).
+ok
+7> chat_registry:list_users().
+[<<"alice">>,<<"bob">>]
+8> chat_registry:lookup(<<"bob">>).
+{ok,<0.182.0>}
+9> chat_registry:lookup(<<"carol">>).
+{error,not_found}
+```
+
+A second process that wants the name `<<"alice">>` is refused.
+
+```erlang
+10> Impostor = FakeUser().
+<0.189.0>
+11> chat_registry:register_user(<<"alice">>, Impostor).
+{error,username_taken}
+```
+
+Now Alice's process ends normally and Bob's is killed. Neither unregisters.
+
+```erlang
+12> Alice ! stop.
+stop
+13> chat_registry:list_users().
+[<<"bob">>]
+14> chat_registry:register_user(<<"alice">>, Impostor).
+ok
+15> exit(Bob, kill).
+true
+16> chat_registry:list_users().
+[<<"alice">>]
+```
+
+Both entries disappeared without any cooperation from the dying processes, and the name `<<"alice">>` became free again. `sys:get_state(chat_registry)` prints the raw state map if you want to look inside.
+
+## Why There Are No Locks
+
+Picture two people who register `<<"alice">>` at the same instant. With shared memory, two threads could both see that the name is free and both insert. You would need a lock around "check, then insert".
+
+Here both requests land in the registry's mailbox, one after the other. The server finishes the first `handle_call/3`, including the state update, before it looks at the second message. The second request sees the name as taken. A gen_server serializes all access to its state, so "check, then insert" cannot be interrupted. No lock exists, and none can be forgotten.
+
+The cost is the same property seen from the other side. One process handles one message at a time on one CPU core. Every `lookup/1` from every connection waits in the same queue, and a slow callback delays everyone behind it. Two rules follow.
+
+- Keep callbacks short. Never do slow work such as network calls inside a server that many processes depend on.
+- Watch servers that sit on a hot path. `chat_registry` handles a request in a few microseconds, so it copes with a lot of traffic before it becomes the bottleneck.
+
+Lesson 27 measures this server under load and moves the read path to an ETS table that many processes can read at once.
+
+## Exercises
+
+**Exercise 1: Count Users**
+
+Add `count/0`, which returns the number of registered users. Use `maps:size/1`.
+
+```erlang
+% Expected:
+% chat_registry:count().  => 0
+% chat_registry:register_user(<<"alice">>, self()).
+% chat_registry:count().  => 1
+```
+
+**Exercise 2: Reverse Lookup**
+
+Add `whois(Pid)`, which returns `{ok, Username}` or `{error, not_found}` for a pid.
+
+```erlang
+% Expected:
+% chat_registry:register_user(<<"alice">>, self()).
+% chat_registry:whois(self()).  => {ok,<<"alice">>}
+```
+
+**Exercise 3: Remove the Scan**
+
+Change the state to a tuple of two maps, `{Users, Refs}`, where `Refs` maps a monitor reference to a username. Update every callback so the `'DOWN'` clause finds the username with `maps:take/2` instead of `maps:filter/2`. The client API and the shell session above must behave exactly as before.
+
+```erlang
+init([]) ->
+    {ok, {#{}, #{}}}.
+```
+
+**Exercise 4: Reject Dead Pids**
+
+Registering a pid that is already dead works, because the `'DOWN'` message arrives right after. Make `register_user/2` return `{error, not_alive}` in that case instead. `is_process_alive/1` is enough for local pids.
+
+```erlang
+% Expected:
+% Dead = spawn(fun() -> ok end).
+% chat_registry:register_user(<<"ghost">>, Dead).  => {error,not_alive}
+```
+
+## Key Takeaways
+
+- **Design the API and state first.** Decide what the server owns, what callers can ask and what can go wrong before writing callbacks
+- **Monitor what you track.** A server that stores pids should monitor them and clean up in `handle_info/2` when `'DOWN'` arrives
+- **Call `monitor/2` in a callback** so the server process is the one that receives the `'DOWN'` message
+- **Keep the monitor reference** in the state so you can `demonitor(Ref, [flush])` on a manual unregister
+- **Calls serialize access.** A check followed by an update inside one callback cannot be interrupted, so no locks are needed
+- **A single process is a queue.** Keep callbacks fast, because every caller waits behind the current message
+- **`-spec`** documents types for readers and for dialyzer without changing how the code runs
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l13_take_missing_key",
+      question: "What does maps:take/2 return when the username is not registered?",
+      code: "Users = #{<<\"alice\">> => {self(), make_ref()}}.\nmaps:take(<<\"bob\">>, Users).\n% => ___",
+      answer: "error",
+      hint: "It is the same atom maps:find/2 returns for a missing key.",
+      explanation: "maps:take/2 returns a tuple of value and remaining map for a known key, and the atom error otherwise. The unregister clause turns both cases into ok."
+    },
+    {
+      id: "l13_monitor_registered_pid",
+      question: "Which function makes the registry receive a 'DOWN' message when the user process dies?",
+      code: "handle_call({register, Username, Pid}, _From, Users) ->\n    Ref = ___(process, Pid),\n    {reply, ok, Users#{Username => {Pid, Ref}}}.",
+      answer: "monitor",
+      hint: "Lesson 10 used it to watch a process without linking to it.",
+      explanation: "monitor/2 runs inside the callback, so the registry process owns the monitor and gets the 'DOWN' message."
+    },
+    {
+      id: "l13_lookup_unknown_user",
+      question: "What error reason does lookup give for an unknown user?",
+      code: "handle_call({lookup, Username}, _From, Users) ->\n    case maps:find(Username, Users) of\n        {ok, {Pid, _Ref}} -> {reply, {ok, Pid}, Users};\n        error -> {reply, {error, not_found}, Users}\n    end.\n\nhandle_call({lookup, <<\"carol\">>}, from, #{}).\n% => {reply, {error, ___}, #{}}",
+      answer: "not_found",
+      hint: "The map is empty, so maps:find/2 returns error.",
+      explanation: "A callback is a plain function, so we can call it directly with a made-up From value. The second case clause builds the error reply."
+    },
+    {
+      id: "l13_flush_option",
+      question: "Which option also removes a 'DOWN' message that is already in the mailbox?",
+      code: "handle_call({unregister, Username}, _From, Users) ->\n    case maps:take(Username, Users) of\n        {{_Pid, Ref}, Rest} ->\n            demonitor(Ref, [___]),\n            {reply, ok, Rest};\n        error ->\n            {reply, ok, Users}\n    end.",
+      answer: "flush",
+      hint: "The user process might die just before the demonitor call.",
+      explanation: "Without flush, a late 'DOWN' message for a removed entry could still reach handle_info/2."
+    },
+    {
+      id: "l13_second_registration",
+      question: "What error reason does the second registration of the same name get?",
+      code: "handle_call({register, Username, Pid}, _From, Users) ->\n    case maps:is_key(Username, Users) of\n        true ->\n            {reply, {error, username_taken}, Users};\n        false ->\n            Ref = monitor(process, Pid),\n            {reply, ok, Users#{Username => {Pid, Ref}}}\n    end.\n\n{reply, ok, Users} = handle_call({register, <<\"alice\">>, self()}, from, #{}).\n{reply, Reply, _} = handle_call({register, <<\"alice\">>, self()}, from, Users).\nReply.\n% => {error, ___}",
+      answer: "username_taken",
+      hint: "The state returned by the first call already contains alice.",
+      explanation: "The first call returns a new state with alice in it. Passing that state to the second call makes maps:is_key/2 return true."
+    },
+    {
+      id: "l13_down_removes_user",
+      question: "What does the server reply with after the registered process has been killed?",
+      code: "init([]) ->\n    {ok, #{}}.\n\nhandle_call({register, Name, Pid}, _From, Users) ->\n    {reply, ok, Users#{Name => {Pid, monitor(process, Pid)}}};\nhandle_call(list_users, _From, Users) ->\n    {reply, maps:keys(Users), Users}.\n\nhandle_info({'DOWN', Ref, process, _Pid, _Reason}, Users) ->\n    {noreply, maps:filter(fun(_Name, {_P, R}) -> R =/= Ref end, Users)}.\n\n{ok, Registry} = gen_server:start_link(?MODULE, [], []).\nUser = spawn(fun() -> receive stop -> ok end end).\ngen_server:call(Registry, {register, <<\"alice\">>, User}).\n% => ok\nexit(User, kill).\ntimer:sleep(100).\ngen_server:call(Registry, list_users).\n% => ___",
+      answer: "[]",
+      hint: "The 'DOWN' message reaches handle_info/2 before the second call.",
+      explanation: "Killing the user process triggers the monitor. handle_info/2 filters out the entry with that reference, so the list of users is empty."
+    },
+    {
+      id: "l13_serialized_registration",
+      question: "Five processes try to register the same name at once. How many of them get ok?",
+      code: "init([]) ->\n    {ok, #{}}.\n\nhandle_call({register, Name, Pid}, _From, Users) ->\n    case maps:is_key(Name, Users) of\n        true -> {reply, taken, Users};\n        false -> {reply, ok, Users#{Name => Pid}}\n    end.\n\n{ok, Registry} = gen_server:start_link(?MODULE, [], []).\nParent = self().\n[spawn(fun() ->\n    Parent ! {result, gen_server:call(Registry, {register, <<\"alice\">>, self()})}\nend) || _ <- lists:seq(1, 5)].\nResults = [receive {result, R} -> R after 1000 -> timeout end || _ <- lists:seq(1, 5)].\nlength([ok || ok <- Results]).\n% => ___",
+      answer: "1",
+      hint: "The server handles one message at a time.",
+      explanation: "All five requests queue up in the mailbox. The first one handled inserts the name, and the other four see it as taken. No lock is needed."
+    }
+  ]}
+/>

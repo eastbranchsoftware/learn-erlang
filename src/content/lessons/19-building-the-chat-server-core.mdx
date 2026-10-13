@@ -1,0 +1,370 @@
+---
+title: "Building the Chat Server Core"
+description: "Combine the listener, a connection supervisor and one gen_server per client into a supervised server that speaks HTTP and WebSocket"
+postNumber: 19
+publishDate: 2026-09-19T00:00:00Z
+tags: ["intermediate", "chat-server", "otp"]
+difficulty: "intermediate"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+All the parts exist now. `chat_http` parses requests, `chat_ws` handles the handshake and frames, and a supervision tree keeps servers alive. The demo `http_server` that glued them together is a bare `spawn` with blocking `recv` calls. Nothing supervises it, and its handlers cannot receive messages from other processes. Three OTP modules replace it.
+
+## The Architecture
+
+```text
+chat_server_sup (one_for_one)
+├── chat_stats
+├── chat_registry
+├── chat_conn_sup (simple_one_for_one)
+│   ├── chat_connection   one per client
+│   └── chat_connection
+└── chat_listener         owns the listen socket, runs the acceptor
+```
+
+Every client gets its own `chat_connection` process, as in the echo server from lesson 15. Now each one is a gen_server under a supervisor. Processes share no memory, so a bug that kills one connection cannot damage another.
+
+Delete `src/http_server.erl`. Its job moves into the new modules.
+
+## A Supervisor for Identical Children
+
+`chat_server_sup` lists its children in `init/1`. Connections are different. There are none at startup, they appear at any time, and they all look the same. The `simple_one_for_one` strategy has a single child spec that acts as a template, and `supervisor:start_child/2` starts a new child from it.
+
+**Create `src/chat_conn_sup.erl`:**
+
+```erlang
+-module(chat_conn_sup).
+-behaviour(supervisor).
+
+-export([start_link/0, start_connection/1]).
+-export([init/1]).
+
+start_link() ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
+
+start_connection(Socket) ->
+    supervisor:start_child(?MODULE, [Socket]).
+
+init([]) ->
+    SupFlags = #{strategy => simple_one_for_one},
+    Child = #{
+        id => chat_connection,
+        start => {chat_connection, start_link, []},
+        restart => temporary
+    },
+    {ok, {SupFlags, [Child]}}.
+```
+
+The list passed to `start_child/2` is appended to the arguments in the `start` tuple. `start_connection(Socket)` therefore calls `chat_connection:start_link(Socket)`.
+
+Children are `temporary`. A connection that dies is never restarted, because its socket died with it. The browser connects again and gets a new process. The supervisor still earns its place. It logs crashes, it can list and count connections, and it stops them all in order when the application shuts down.
+
+## The Listener
+
+If the owner of the listen socket dies, the socket closes, so the owner should do as little as possible. `chat_listener` is a gen_server that opens the socket in `init/1` and then only waits. The blocking `gen_tcp:accept/1` loop runs in a second process, the acceptor, so the gen_server can still answer its supervisor.
+
+**Create `src/chat_listener.erl`:**
+
+```erlang
+-module(chat_listener).
+-behaviour(gen_server).
+
+-export([start_link/1]).
+-export([init/1, handle_call/3, handle_cast/2]).
+
+start_link(Port) ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, Port, []).
+
+init(Port) ->
+    Options = [binary, {packet, raw}, {active, false}, {reuseaddr, true}],
+    {ok, ListenSocket} = gen_tcp:listen(Port, Options),
+    spawn_link(fun() -> accept_loop(ListenSocket) end),
+    io:format("Chat server listening on port ~p~n", [Port]),
+    {ok, ListenSocket}.
+
+handle_call(_Request, _From, ListenSocket) ->
+    {reply, ok, ListenSocket}.
+
+handle_cast(_Msg, ListenSocket) ->
+    {noreply, ListenSocket}.
+
+%% Runs in the acceptor process.
+accept_loop(ListenSocket) ->
+    {ok, Socket} = gen_tcp:accept(ListenSocket),
+    {ok, Pid} = chat_conn_sup:start_connection(Socket),
+    ok = gen_tcp:controlling_process(Socket, Pid),
+    chat_connection:socket_ready(Pid),
+    accept_loop(ListenSocket).
+```
+
+The acceptor is started with `spawn_link`, and the listener does not trap exits. The two processes share their fate. If the acceptor crashes, the exit signal kills the listener, the listen socket closes, and `chat_server_sup` starts a fresh pair. If the listener dies, the link takes the acceptor down with it. A listener that accepts nothing cannot exist.
+
+## Handing Over the Socket
+
+The order of the lines after `accept` matters.
+
+1. The accepted socket is passive, because the listen socket is. Bytes the client sends now wait in the operating system's buffer.
+2. `start_connection/1` starts the connection process. It knows the socket but does not own it. If it enabled active mode now, the `{tcp, ...}` messages would go to the owner, which is still the acceptor.
+3. `controlling_process/2` makes the connection process the owner.
+4. `socket_ready/1` tells the connection so. Only then does it set `{active, once}`, and the buffered bytes arrive in the right mailbox.
+
+The socket stays passive until step 4, so no data is lost or misdelivered, however fast the client sends.
+
+## The Connection Process
+
+**Create `src/chat_connection.erl`:**
+
+```erlang
+-module(chat_connection).
+-behaviour(gen_server).
+
+-export([start_link/1, socket_ready/1]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+
+-record(state, {socket, buffer = <<>>, phase = http, username, rooms = []}).
+
+start_link(Socket) ->
+    gen_server:start_link(?MODULE, Socket, []).
+
+socket_ready(Pid) ->
+    gen_server:cast(Pid, socket_ready).
+
+init(Socket) ->
+    {ok, #state{socket = Socket}}.
+
+handle_call(_Request, _From, State) ->
+    {reply, ok, State}.
+
+handle_cast(socket_ready, State) ->
+    activate(State).
+
+handle_info({tcp, Socket, Data}, #state{socket = Socket, buffer = Buffer} = State) ->
+    process(State#state{buffer = <<Buffer/binary, Data/binary>>});
+handle_info({tcp_closed, _Socket}, State) ->
+    {stop, normal, State};
+handle_info({tcp_error, _Socket, _Reason}, State) ->
+    {stop, normal, State};
+handle_info(_Msg, State) ->
+    {noreply, State}.
+
+terminate(_Reason, #state{socket = Socket}) ->
+    gen_tcp:close(Socket).
+
+%% Handle everything that is complete in the buffer, then ask for more.
+process(#state{phase = http, buffer = Buffer} = State) ->
+    case chat_http:parse_request(Buffer) of
+        {ok, Request, Rest} ->
+            handle_request(Request, State#state{buffer = Rest});
+        more ->
+            activate(State);
+        {error, bad_request} ->
+            respond(400, <<"text/plain">>, <<"Bad Request\n">>, State)
+    end;
+process(#state{phase = websocket, buffer = Buffer} = State) ->
+    case chat_ws:decode_frame(Buffer) of
+        {ok, Frame, Rest} ->
+            handle_frame(Frame, State#state{buffer = Rest});
+        more ->
+            activate(State);
+        {error, _Reason} ->
+            send_frame({close, <<1002:16>>}, State),
+            {stop, normal, State}
+    end.
+
+activate(#state{socket = Socket} = State) ->
+    case inet:setopts(Socket, [{active, once}]) of
+        ok -> {noreply, State};
+        {error, _Reason} -> {stop, normal, State}
+    end.
+
+%%% HTTP phase
+
+handle_request(#{method := 'GET', path := <<"/ws">>} = Request, State) ->
+    case chat_ws:handshake_response(Request) of
+        {ok, Response} ->
+            gen_tcp:send(State#state.socket, Response),
+            process(State#state{phase = websocket});
+        {error, not_websocket} ->
+            respond(400, <<"text/plain">>, <<"WebSocket upgrade expected\n">>, State)
+    end;
+handle_request(#{method := 'GET', path := <<"/">>}, State) ->
+    File = filename:join(code:priv_dir(chat_server), "index.html"),
+    {ok, Body} = file:read_file(File),
+    respond(200, <<"text/html; charset=utf-8">>, Body, State);
+handle_request(_Request, State) ->
+    respond(404, <<"text/plain">>, <<"Not Found\n">>, State).
+
+respond(Status, ContentType, Body, State) ->
+    Headers = [{<<"Content-Type">>, ContentType}, {<<"Connection">>, <<"close">>}],
+    gen_tcp:send(State#state.socket, chat_http:response(Status, Headers, Body)),
+    {stop, normal, State}.
+
+%%% WebSocket phase
+
+handle_frame({text, Text}, State) ->
+    send_frame({text, [<<"echo: ">>, Text]}, State),
+    process(State);
+handle_frame({ping, Payload}, State) ->
+    send_frame({pong, Payload}, State),
+    process(State);
+handle_frame({close, Payload}, State) ->
+    send_frame({close, Payload}, State),
+    {stop, normal, State};
+handle_frame(_Frame, State) ->
+    process(State).
+
+send_frame(Frame, #state{socket = Socket}) ->
+    gen_tcp:send(Socket, chat_ws:encode_frame(Frame)).
+```
+
+The state is a record (lesson 6). `username` and `rooms` stay unused for now.
+
+**The buffer.** Socket messages are not calls or casts, so they arrive in `handle_info/2`. Every `{tcp, Socket, Data}` message appends to `buffer`, and `process/1` parses from the front of it. `more` means the request or frame is incomplete, so we keep the bytes and call `activate/1`. After a complete frame, `handle_frame/2` calls `process/1` again, because one TCP packet can hold several frames. The socket is re-armed only when nothing complete is left, which is the flow control from lesson 15.
+
+**The phase.** A connection starts in phase `http`. A valid upgrade request for `/ws` switches it to `websocket`, and from then on the same buffer is read as frames. Plain HTTP requests get one response and `{stop, normal, State}`. Routing is pattern matching in `handle_request/2`, so a new path is a new clause above the 404 clause.
+
+**`terminate/2`** closes the socket on every orderly stop. It does not run after a `kill`, but the socket still closes, because a socket dies with its owner.
+
+## Wiring It Into the Tree
+
+**Update `src/chat_server_sup.erl`:**
+
+```erlang
+%% In src/chat_server_sup.erl, replace the Children list in init/1
+    Children = [
+        #{id => chat_stats, start => {chat_stats, start_link, []}},
+        #{id => chat_registry, start => {chat_registry, start_link, []}},
+        #{id => chat_conn_sup, start => {chat_conn_sup, start_link, []},
+          type => supervisor, shutdown => infinity},
+        #{id => chat_listener, start => {chat_listener, start_link, [8080]}}
+    ],
+```
+
+The specs now rely on the defaults from lesson 14. Children start top to bottom, and the listener comes last, so no client can connect before `chat_conn_sup` exists.
+
+## Trying It Out
+
+Start `rebar3 shell`. It prints `Chat server listening on port 8080`, and `curl -i http://localhost:8080/` returns the page as before. Open `http://localhost:8080/` in two browser tabs and run this in the console of each.
+
+```javascript
+const ws = new WebSocket("ws://localhost:8080/ws");
+ws.onmessage = (event) => console.log(event.data);
+ws.onclose = () => console.log("closed");
+ws.onopen = () => ws.send("hi");
+// echo: hi
+```
+
+Each tab has its own process. Kill the first one.
+
+```erlang
+1> supervisor:count_children(chat_conn_sup).
+[{specs,1},{active,2},{supervisors,0},{workers,2}]
+2> [{_, First, _, _}, {_, Second, _, _}] = supervisor:which_children(chat_conn_sup).
+[{undefined,<0.238.0>,worker,[chat_connection]},
+ {undefined,<0.240.0>,worker,[chat_connection]}]
+3> exit(First, kill).
+true
+=SUPERVISOR REPORT==== 19-Sep-2026::10:35:36.603890 ===
+    supervisor: {local,chat_conn_sup}
+    errorContext: child_terminated
+    reason: killed
+    ...
+4> supervisor:count_children(chat_conn_sup).
+[{specs,1},{active,1},{supervisors,0},{workers,1}]
+```
+
+One tab logs `closed`. The other still gets an echo for `ws.send("again")`. Nothing was restarted, because the child is `temporary`. Now try `exit(whereis(chat_listener), kill).` The supervisor prints `Chat server listening on port 8080` again, and the open WebSocket keeps working. Connections belong to `chat_conn_sup`, not to the listener.
+
+## Exercises
+
+**Exercise 1: Count connections**
+
+Add `chat_conn_sup:count/0`, which returns the number of live connections.
+
+```erlang
+% Expected with two open tabs:
+% chat_conn_sup:count().  => 2
+```
+
+**Exercise 2: A stats page**
+
+Add a route for `GET /stats` that returns `chat_stats:get_all()` as plain text. `io_lib:format("~p~n", [Term])` produces iodata.
+
+```bash
+curl http://localhost:8080/stats
+# Expected: #{}
+```
+
+**Exercise 3: Drop silent clients**
+
+A client that connects and sends nothing keeps a process forever. A callback can return a timeout, as in `{noreply, State, 10000}`. If no message arrives in that time, `handle_info(timeout, State)` is called. Stop connections that are still in phase `http` after 10 seconds.
+
+```bash
+nc localhost 8080
+# Expected: the connection closes after 10 seconds without input
+```
+
+## Key Takeaways
+
+- **One process per connection.** Each client has its own gen_server, state and socket. A crash affects one user
+- **`simple_one_for_one`** supervises many identical children that are started on demand with `supervisor:start_child/2`. The extra arguments are appended to the `start` tuple
+- **Connections are `temporary`.** A dead socket cannot be revived, so the client reconnects instead
+- **Hand over, then activate.** Accept a passive socket, start the process, call `controlling_process/2`, and only then let the new owner set `{active, once}`
+- **Buffer plus phase** turns a byte stream into requests and frames. Parse what is complete, keep the rest, re-arm the socket
+- **Start order is dependency order.** The listener starts last, after everything a new connection needs
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l19_simple_strategy",
+      question: "Which strategy supervises many identical children that are started on demand?",
+      code: "init([]) ->\n    SupFlags = #{strategy => ___},\n    Child = #{\n        id => chat_connection,\n        start => {chat_connection, start_link, []},\n        restart => temporary\n    },\n    {ok, {SupFlags, [Child]}}.",
+      answer: "simple_one_for_one",
+      hint: "It has exactly one child spec, which serves as a template.",
+      explanation: "simple_one_for_one starts with no children. Each supervisor:start_child/2 call creates one more from the single child spec."
+    },
+    {
+      id: "l19_connection_restart_type",
+      question: "Which restart type fits a process whose socket dies with it?",
+      code: "init([]) ->\n    Child = #{\n        id => chat_connection,\n        start => {chat_connection, start_link, []},\n        restart => ___\n    },\n    {ok, {#{strategy => simple_one_for_one}, [Child]}}.",
+      answer: "temporary",
+      hint: "The child is never restarted, whatever the exit reason.",
+      explanation: "A restarted connection would have no socket. The client reconnects and gets a new process."
+    },
+    {
+      id: "l19_children_on_demand",
+      question: "How many children are active after three start_child calls?",
+      code: "start_conn(_Id) ->\n    {ok, spawn_link(fun() -> receive stop -> ok end end)}.\n\ninit([]) ->\n    Child = #{id => conn, start => {?MODULE, start_conn, []}, restart => temporary},\n    {ok, {#{strategy => simple_one_for_one}, [Child]}}.\n\n{ok, Sup} = supervisor:start_link(?MODULE, []).\nproplists:get_value(active, supervisor:count_children(Sup)).\n% => 0\n[supervisor:start_child(Sup, [Id]) || Id <- [1, 2, 3]].\nproplists:get_value(active, supervisor:count_children(Sup)).\n% => ___",
+      answer: "3",
+      hint: "The supervisor starts empty. Every call adds one child.",
+      explanation: "A simple_one_for_one supervisor has no children until start_child/2 is called. Each call starts one from the template."
+    },
+    {
+      id: "l19_appended_arguments",
+      question: "The start tuple already has the argument lobby. What does the child report as its second argument?",
+      code: "start_conn(Room, Id) ->\n    Pid = spawn_link(fun() ->\n        receive {who, From} -> From ! {Room, Id} end\n    end),\n    {ok, Pid}.\n\ninit([]) ->\n    Child = #{id => conn, start => {?MODULE, start_conn, [lobby]}, restart => temporary},\n    {ok, {#{strategy => simple_one_for_one}, [Child]}}.\n\n{ok, Sup} = supervisor:start_link(?MODULE, []).\n{ok, Pid} = supervisor:start_child(Sup, [7]).\nPid ! {who, self()}.\nreceive Reply -> Reply after 1000 -> timeout end.\n% => {lobby, ___}",
+      answer: "7",
+      hint: "The list given to start_child/2 is appended to the list in the child spec.",
+      explanation: "The supervisor calls start_conn(lobby, 7). chat_conn_sup uses an empty list in the spec, so the socket is the only argument."
+    },
+    {
+      id: "l19_buffer_rest",
+      question: "Two chunks arrive. What stays in the buffer after the first complete line is taken out?",
+      code: "feed(Buffer, Data) ->\n    New = <<Buffer/binary, Data/binary>>,\n    case binary:split(New, <<\"\\n\">>) of\n        [Line, Rest] -> {line, Line, Rest};\n        [_Incomplete] -> {more, New}\n    end.\n\n{more, Buffer} = feed(<<>>, <<\"hel\">>).\nfeed(Buffer, <<\"lo\\nwor\">>).\n% => {line, <<\"hello\">>, ___}",
+      answer: "<<\"wor\">>",
+      hint: "Everything after the newline belongs to the next line.",
+      explanation: "The connection works the same way. It appends new data, parses what is complete, and keeps the rest for the next round."
+    },
+    {
+      id: "l19_crash_is_isolated",
+      question: "One of two connections is killed. Is the other one still alive?",
+      code: "start_conn() ->\n    {ok, spawn_link(fun() -> receive stop -> ok end end)}.\n\ninit([]) ->\n    Child = #{id => conn, start => {?MODULE, start_conn, []}, restart => temporary},\n    {ok, {#{strategy => simple_one_for_one}, [Child]}}.\n\n{ok, Sup} = supervisor:start_link(?MODULE, []).\n{ok, Alice} = supervisor:start_child(Sup, []).\n{ok, Bob} = supervisor:start_child(Sup, []).\nexit(Alice, kill).\ntimer:sleep(100).\n{is_process_alive(Bob), proplists:get_value(active, supervisor:count_children(Sup))}.\n% => {___, 1}",
+      answer: "true",
+      hint: "The children are linked to the supervisor, not to each other.",
+      explanation: "The supervisor traps the exit of the killed child and removes it. Siblings are not affected, and a temporary child is not restarted."
+    }
+  ]}
+/>

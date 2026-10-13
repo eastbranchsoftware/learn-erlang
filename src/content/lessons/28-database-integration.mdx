@@ -1,0 +1,315 @@
+---
+title: "Database Integration"
+description: "Store accounts and chat history in Mnesia so they survive a restart of the server"
+postNumber: 28
+publishDate: 2026-09-19T00:00:00Z
+tags: ["advanced", "database", "mnesia"]
+difficulty: "advanced"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+The ETS table from lesson 27 is gone when its owner exits, and so is everything else the server knows. Accounts live in the state of `chat_auth` and history in the room processes, so a restart deletes every user and every message. Mnesia is the database that ships with OTP. It stores records in tables, supports transactions, runs inside the VM and can keep each table on disk. Lesson 32 replicates its tables across nodes.
+
+## Schema First
+
+Mnesia keeps a schema, its own table that lists all tables and where they live. A freshly started Mnesia has a schema in RAM only. Creating a disk table then fails with `{aborted,{bad_type,note,disc_copies,nonode@nohost}}`.
+
+`mnesia:create_schema/1` writes a disk schema for a list of nodes. It must run before `mnesia:start/0`. Try it in a fresh `erl`.
+
+```erlang
+1> mnesia:create_schema([node()]).
+ok
+2> mnesia:start().
+ok
+3> mnesia:create_table(note, [{attributes, [id, text]}, {disc_copies, [node()]}]).
+{atomic,ok}
+```
+
+The files go to a directory named after the node, here `Mnesia.nonode@nohost` in the current directory. A table row is a tuple. Its first element is the table name and the second is the key. `disc_copies` keeps the whole table in RAM and logs every change to disk, so reads are as fast as ETS.
+
+## Transactions
+
+`mnesia:transaction/1` runs a fun. Inside it, `mnesia:write/1` and `mnesia:read/2` take locks on what they touch. Either every write in the fun happens or none does.
+
+```erlang
+4> mnesia:transaction(fun() -> mnesia:write({note, 1, <<"buy milk">>}) end).
+{atomic,ok}
+5> mnesia:transaction(fun() -> mnesia:read(note, 1) end).
+{atomic,[{note,1,<<"buy milk">>}]}
+6> mnesia:transaction(fun() -> mnesia:write({note, 2, <<"lost">>}), mnesia:abort(changed_my_mind) end).
+{aborted,changed_my_mind}
+7> mnesia:dirty_read(note, 2).
+[]
+```
+
+The result is `{atomic, Value}` with the fun's return value, or `{aborted, Reason}`. `mnesia:abort/1` and any exception inside the fun roll back all writes. Mnesia may run the fun several times when transactions conflict, so it must not have side effects such as sending messages.
+
+The `dirty_` functions skip the locks. `mnesia:dirty_write/1` and `mnesia:dirty_read/2` were five times faster than their transaction forms here. Each one is atomic on its own. A sequence of them is not.
+
+- **Chat messages are append-only.** Each message gets a fresh key and nothing reads before writing. A dirty write is fine.
+- **Registration is read, then write.** Two registrations of `<<"alice">>` could both read "free" and both write. That needs a transaction. Today `chat_auth` happens to serialize registrations. The transaction keeps them correct when a second node writes too.
+
+## The Message Key
+
+A room needs its last 50 messages. A `set` keyed by a message id would force a scan of all messages. We use an `ordered_set` with the key `{Room, Timestamp, Unique}`. An ordered set keeps its keys sorted, and tuples sort element by element, so each room's messages sit next to each other in time order.
+
+To read the newest messages, start behind the room's last key and walk backwards with `mnesia:dirty_prev/2`. The start key is `{Room, last, 0}`. No such row exists, which an ordered set allows. In Erlang's term order every number is smaller than every atom, so `last` sorts after all timestamps of that room and before the next room. Reading N messages costs N steps of O(log M) in a table of M messages. With 100,000 messages in a room, `recent_messages/2` returned 50 of them in 29 microseconds here.
+
+**Create `src/chat_store.erl`:**
+
+```erlang
+-module(chat_store).
+
+-export([init/0, save_message/3, recent_messages/2, save_user/3, find_user/1]).
+
+-record(chat_user, {username, salt, hash}).
+-record(chat_message, {id, room, from, text, timestamp}).
+
+%% Safe to call on every boot.
+init() ->
+    case mnesia:change_table_copy_type(schema, node(), disc_copies) of
+        {atomic, ok} -> ok;
+        {aborted, {already_exists, schema, _Node, disc_copies}} -> ok
+    end,
+    ensure_table(chat_user, [{attributes, record_info(fields, chat_user)},
+                             {disc_copies, [node()]}]),
+    ensure_table(chat_message, [{attributes, record_info(fields, chat_message)},
+                                {disc_copies, [node()]},
+                                {type, ordered_set}]),
+    ok = mnesia:wait_for_tables([chat_user, chat_message], 10000).
+
+ensure_table(Name, Options) ->
+    case mnesia:create_table(Name, Options) of
+        {atomic, ok} -> ok;
+        {aborted, {already_exists, Name}} -> ok
+    end.
+
+save_user(Username, Salt, Hash) ->
+    Insert = fun() ->
+        case mnesia:read(chat_user, Username) of
+            [] -> mnesia:write(#chat_user{username = Username, salt = Salt, hash = Hash});
+            [_Existing] -> mnesia:abort(username_taken)
+        end
+    end,
+    case mnesia:transaction(Insert) of
+        {atomic, ok} -> ok;
+        {aborted, username_taken} -> {error, username_taken}
+    end.
+
+find_user(Username) ->
+    case mnesia:dirty_read(chat_user, Username) of
+        [#chat_user{salt = Salt, hash = Hash}] -> {ok, {Salt, Hash}};
+        [] -> {error, not_found}
+    end.
+
+save_message(Room, From, Text) ->
+    Now = erlang:system_time(microsecond),
+    Id = {Room, Now, erlang:unique_integer([positive])},
+    mnesia:dirty_write(#chat_message{id = Id, room = Room, from = From,
+                                     text = Text, timestamp = Now}).
+
+%% The newest N messages of a room, oldest first.
+recent_messages(Room, N) ->
+    collect(mnesia:dirty_prev(chat_message, {Room, last, 0}), Room, N, []).
+
+collect({Room, _Time, _Unique} = Id, Room, N, Acc) when N > 0 ->
+    [#chat_message{from = From, text = Text}] = mnesia:dirty_read(chat_message, Id),
+    Event = #{type => message, room => Room, from => From, text => Text},
+    collect(mnesia:dirty_prev(chat_message, Id), Room, N - 1, [Event | Acc]);
+collect(_Other, _Room, _N, Acc) ->
+    Acc.
+```
+
+A record from lesson 06 is a tuple with the record name first, which is the row shape Mnesia wants. The table is named after the record, `record_info(fields, chat_user)` supplies the column names at compile time, and the first field is the key.
+
+`init/0` does not call `create_schema/1`. Our application will list `mnesia` as a dependency, so Mnesia is already running when `init/0` is called. `mnesia:change_table_copy_type(schema, node(), disc_copies)` turns the RAM schema of a running node into a disk schema. On later boots both steps report `already_exists`. Loading tables from disk takes time, so `mnesia:wait_for_tables/2` blocks until they are readable.
+
+`collect/4` stops when the key belongs to another room, when N reaches zero, or at `'$end_of_table'`. `erlang:unique_integer/1` keeps two messages in the same microsecond apart.
+
+## Wiring It In
+
+Mnesia must start before our application, and the store must be ready before the supervisor starts anything.
+
+```erlang
+%% In src/chat_server.app.src
+  {applications, [kernel, stdlib, crypto, mnesia]},
+```
+
+```erlang
+%% In src/chat_server_app.erl
+start(_StartType, _StartArgs) ->
+    ok = chat_store:init(),
+    chat_server_sup:start_link().
+```
+
+Set the data directory in `config/sys.config` from lesson 25. Mnesia creates the directory but not its parents. The `vm.args` form is `-mnesia dir '"mnesia_data"'`.
+
+```erlang
+%% In config/sys.config, next to the chat_server entry
+ {mnesia, [{dir, "mnesia_data"}]},
+```
+
+A room loads its history when it starts and saves every message. The in-memory history stays, so joins do not touch the database.
+
+```erlang
+%% In src/chat_room.erl
+init(Name) ->
+    History = lists:reverse(chat_store:recent_messages(Name, ?HISTORY_SIZE)),
+    {ok, #{name => Name, members => #{}, history => History}}.
+```
+
+In the `{message, Sender, Text}` clause, add `ok = chat_store:save_message(Name, Sender, Text),` on the line before `notify(Event, State)`. Only the `History` line is new in `init/1`, so keep anything else you already have there, such as the `room_created` log from lesson 26.
+
+`chat_auth` drops the `users` map. Sessions stay in its state. A lost session costs the user one login, which is not worth a disk write per token.
+
+```erlang
+%% In src/chat_auth.erl
+init([]) ->
+    {ok, #{sessions => #{}}}.
+
+handle_call({register, Username, Password}, _From, State) ->
+    case {valid_username(Username), byte_size(Password) >= 8} of
+        {false, _} ->
+            {reply, {error, invalid_username}, State};
+        {true, false} ->
+            {reply, {error, weak_password}, State};
+        {true, true} ->
+            Salt = crypto:strong_rand_bytes(16),
+            {reply, chat_store:save_user(Username, Salt, hash(Password, Salt)), State}
+    end;
+```
+
+In the `login` clause, remove `users := Users` from the pattern, replace `maps:find(Username, Users)` with `chat_store:find_user(Username)`, and change the `error` branch to `{error, not_found}`.
+
+## Surviving a Restart
+
+Start `rebar3 shell`, create an account and say something.
+
+```erlang
+1> chat_auth:register(<<"alice">>, <<"correct horse">>).
+ok
+2> chat_room:join(<<"lobby">>, <<"alice">>, self()).
+{ok,[]}
+3> chat_room:send_message(<<"lobby">>, <<"alice">>, <<"does this survive?">>).
+ok
+4> q().
+ok
+```
+
+The directory `mnesia_data` now holds `schema.DAT`, `chat_user.DCD` and `chat_message.DCD`. Start `rebar3 shell` again.
+
+```erlang
+1> {ok, Token} = chat_auth:login(<<"alice">>, <<"correct horse">>), ok.
+ok
+2> chat_room:join(<<"lobby">>, <<"alice">>, self()).
+{ok,[#{type => message,text => <<"does this survive?">>,
+       room => <<"lobby">>,from => <<"alice">>}]}
+```
+
+The account and the message outlived the VM. In the browser, log in after a restart and the lobby history is there.
+
+## Pitfalls
+
+**The schema belongs to a node name.** Data created by `nonode@nohost` under `rebar3 shell` is not usable by a release node with a name from `vm.args`. Renaming a node orphans its database.
+
+**A commit is not an fsync.** Mnesia flushes its log in the background. We saved a user in a transaction, called `halt()` right away, and the user was gone after the restart. `q()` and `init:stop/0` shut Mnesia down cleanly, and `mnesia:sync_log/0` forces a flush. A `kill -9` can lose the last moments.
+
+**`disc_copies` means all data in RAM.** Chat history grows without bound, so Exercise 2 prunes it. `disc_only_copies` keeps rows on disk only, in dets files with a 2 GB limit per table and no `ordered_set`.
+
+**Mnesia is not a SQL server.** It has no query planner, and large tables load slowly at boot. It fits accounts and recent history. For years of searchable archives, use an external database.
+
+## Exercises
+
+**Exercise 1: Change Password**
+
+Add `chat_store:update_user(Username, Salt, Hash)`, which returns `ok` or `{error, not_found}`. Read and write in one transaction, and abort when the user does not exist.
+
+```erlang
+% Expected:
+% chat_store:update_user(<<"nobody">>, <<>>, <<>>).  => {error,not_found}
+```
+
+**Exercise 2: Prune History**
+
+Add `chat_store:prune(Room, Keep)`, which deletes all but the newest `Keep` messages of a room and returns the number of deleted rows. Walk back as `collect/4` does, skip `Keep` keys, then use `mnesia:dirty_delete/2`.
+
+```erlang
+% Expected with 60 messages in the lobby:
+% chat_store:prune(<<"lobby">>, 50).  => 10
+% length(chat_store:recent_messages(<<"lobby">>, 100)).  => 50
+```
+
+**Exercise 3: A Query With QLC**
+
+QLC is a query language in list comprehension syntax. Add `-include_lib("stdlib/include/qlc.hrl").` and write `messages_from(Room, From)` with `qlc:q([M || M <- mnesia:table(chat_message), ...])` and `qlc:e/1` inside a transaction. It scans the whole table, so time it with `timer:tc/3`.
+
+```erlang
+% Expected:
+% length(chat_store:messages_from(<<"lobby">>, <<"alice">>)).  => 1
+```
+
+## Key Takeaways
+
+- **Mnesia stores records in tables inside the VM.** The record name is the table name and the first field is the key
+- **A disk schema comes first.** Use `mnesia:create_schema/1` before `mnesia:start/0`, or `change_table_copy_type/3` on a running node
+- **Make setup idempotent.** Treat `already_exists` as success, then call `mnesia:wait_for_tables/2`
+- **Transactions return `{atomic, Value}` or `{aborted, Reason}`** and can run more than once, so keep side effects out
+- **Read then write needs a transaction.** Append-only writes with fresh keys can be dirty
+- **Design keys for your reads.** An `ordered_set` keyed by `{Room, Timestamp, Unique}` makes the latest N of a room a short walk
+- **`disc_copies` lives in RAM** and the schema is tied to the node name
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l28_term_order",
+      question: "Does the start key with the atom last sort after a key with a real timestamp?",
+      code: "{<<\"lobby\">>, 1789844458823993, 1506} < {<<\"lobby\">>, last, 0}.\n% => ___",
+      answer: "true",
+      hint: "Numbers sort before atoms.",
+      explanation: "The room names are equal, so the second elements decide. Every number is smaller than every atom."
+    },
+    {
+      id: "l28_record_fields",
+      question: "Which field is last in the list that record_info returns?",
+      code: "-record(chat_user, {username, salt, hash}).\n\nfields() ->\n    record_info(fields, chat_user).\n\nfields().\n% => [username, salt, ___]",
+      answer: "hash",
+      hint: "The fields come back in declaration order.",
+      explanation: "The compiler replaces record_info(fields, Name) with the list of field names. Mnesia uses it as the attribute list."
+    },
+    {
+      id: "l28_storage_type",
+      question: "Which storage type keeps a table in RAM and also on disk?",
+      code: "ensure_users() ->\n    mnesia:create_table(chat_user, [{attributes, [username, salt, hash]},\n                                    {___, [node()]}]).",
+      answer: "disc_copies",
+      hint: "The alternatives are ram_copies and disc_only_copies.",
+      explanation: "disc_copies serves reads from memory and logs writes to disk, so the table survives a restart."
+    },
+    {
+      id: "l28_atomic_result",
+      question: "What does a successful transaction wrap the fun's result in?",
+      code: "mnesia:start().\nmnesia:create_table(l28_note_a, [{attributes, [id, text]}]).\nmnesia:transaction(fun() -> mnesia:write({l28_note_a, 1, <<\"buy milk\">>}) end).\n% => {___, ok}",
+      answer: "atomic",
+      hint: "All writes happened, or none did.",
+      explanation: "mnesia:write/1 returns ok, so the transaction returns {atomic, ok}. Without storage options the table lives in RAM only."
+    },
+    {
+      id: "l28_username_taken",
+      question: "What error reason does the second registration of the same name get?",
+      code: "save_user(Name) ->\n    Insert = fun() ->\n        case mnesia:read(l28_user_c, Name) of\n            [] -> mnesia:write({l28_user_c, Name, hash});\n            [_] -> mnesia:abort(username_taken)\n        end\n    end,\n    case mnesia:transaction(Insert) of\n        {atomic, ok} -> ok;\n        {aborted, Reason} -> {error, Reason}\n    end.\n\nmnesia:start().\nmnesia:create_table(l28_user_c, [{attributes, [username, hash]}]).\nsave_user(<<\"alice\">>).\nsave_user(<<\"alice\">>).\n% => {error, ___}",
+      answer: "username_taken",
+      hint: "The second transaction reads the row the first one wrote.",
+      explanation: "Read and write happen in one transaction, so no other registration can slip in between."
+    },
+    {
+      id: "l28_prev_in_ordered_set",
+      question: "Which timestamp is in the key that dirty_prev finds behind the lobby's messages?",
+      code: "mnesia:start().\nmnesia:create_table(l28_msg_e, [{attributes, [id, text]}, {type, ordered_set}]).\n[mnesia:dirty_write({l28_msg_e, {Room, Time}, <<\"hi\">>})\n || {Room, Time} <- [{<<\"lobby\">>, 1}, {<<\"lobby\">>, 3}, {<<\"zoo\">>, 2}]].\nmnesia:dirty_prev(l28_msg_e, {<<\"lobby\">>, last}).\n% => {<<\"lobby\">>, ___}",
+      answer: "3",
+      hint: "The atom last sorts after every number.",
+      explanation: "dirty_prev/2 returns the largest key smaller than the given one, which is the newest lobby message."
+    }
+  ]}
+/>

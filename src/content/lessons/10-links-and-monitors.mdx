@@ -1,0 +1,391 @@
+---
+title: "Links and Monitors"
+description: "Detect when a process dies with links and monitors, clean up after dead chat members, and restart a crashed worker"
+postNumber: 10
+publishDate: 2026-09-19T00:00:00Z
+tags: ["intermediate", "processes", "fault-tolerance"]
+difficulty: "intermediate"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+The chat room from lesson 09 kept a dead member in its list because a send to a dead pid fails silently. Isolation keeps a crash contained, but the rest of the system still has to find out about it. Erlang has two tools for that. Links tie the fate of two processes together. Monitors let one process watch another.
+
+## Links
+
+A plain `spawn` leaves the two processes unrelated. If the child dies, the parent is not told.
+
+```erlang
+1> self().
+<0.84.0>
+2> spawn(fun() -> exit(oops) end).
+<0.87.0>
+3> self().
+<0.84.0>
+```
+
+`exit/1` from lesson 07 ends the calling process. The shell did not notice. `spawn_link/1` spawns and links in one step.
+
+```erlang
+4> spawn_link(fun() -> exit(oops) end).
+** exception exit: oops
+5> self().
+<0.91.0>
+```
+
+A dying process sends an exit signal with its exit reason to every linked process. An abnormal reason kills the receiver, which then signals its own links. The shell process died with reason `oops` and was replaced, which is why `self()` changed.
+
+Links are symmetric. It does not matter which side created the link. Here process A spawns and links to B, and B fails one second later.
+
+```erlang
+6> A = spawn(fun() ->
+6>     spawn_link(fun() -> timer:sleep(1000), exit(b_failed) end),
+6>     timer:sleep(infinity)
+6> end).
+<0.94.0>
+7> timer:sleep(1200).
+ok
+8> is_process_alive(A).
+false
+```
+
+`link/1` links the caller to an existing pid. Prefer `spawn_link`. With `spawn` followed by `link`, the new process can die in the gap between the two calls.
+
+## Normal and Abnormal Exits
+
+A process whose function returns exits with reason `normal`. So does `exit(normal)`. A `normal` exit signal does not kill linked processes.
+
+```erlang
+9> spawn_link(fun() -> ok end).
+<0.99.0>
+10> self().
+<0.91.0>
+```
+
+Every other reason is abnormal. An uncaught error is one too. Its reason is a tuple of the error and the stack trace, such as `{badarith, [...]}`.
+
+The rule suits processes that cooperate on one job. If a worker finishes, its partners carry on. If it crashes, they are probably waiting for something that will never arrive, so the whole group stops together.
+
+## Trapping Exits
+
+Some process has to survive in order to react. A process that sets the `trap_exit` flag is not killed by exit signals. Each signal is turned into a message of the form `{'EXIT', Pid, Reason}` and put in its mailbox. The quotes are needed because `EXIT` starts with an uppercase letter and would otherwise be a variable.
+
+```erlang
+11> process_flag(trap_exit, true).
+false
+12> spawn_link(fun() -> exit(oops) end).
+<0.103.0>
+13> spawn_link(fun() -> ok end).
+<0.105.0>
+14> flush().
+Shell got {'EXIT',<0.103.0>,oops}
+Shell got {'EXIT',<0.105.0>,normal}
+ok
+```
+
+`process_flag/2` returns the old value of the flag. A trapping process also hears about `normal` exits.
+
+## Stopping Another Process
+
+`exit/2` sends an exit signal to any pid, linked or not, as if a linked process had died with that reason.
+
+```erlang
+15> W = spawn_link(fun() -> timer:sleep(infinity) end).
+<0.108.0>
+16> exit(W, shutdown).
+true
+17> flush().
+Shell got {'EXIT',<0.108.0>,shutdown}
+ok
+```
+
+A process that traps exits turns such a signal into a message and may ignore it. The reason `kill` is the exception. It cannot be trapped.
+
+```erlang
+18> Stubborn = spawn(fun() ->
+18>     process_flag(trap_exit, true),
+18>     receive Msg -> io:format("stubborn got ~p~n", [Msg]) end,
+18>     timer:sleep(infinity)
+18> end).
+<0.112.0>
+19> exit(Stubborn, please_stop).
+stubborn got {'EXIT',<0.91.0>,please_stop}
+true
+20> is_process_alive(Stubborn).
+true
+21> exit(Stubborn, kill).
+true
+22> is_process_alive(Stubborn).
+false
+```
+
+A killed process exits with reason `killed`, not `kill`, so the untrappable signal does not spread over its links. Ask with `shutdown` first and keep `kill` as the last resort.
+
+## Monitors
+
+A link is the wrong tool when you only want to watch. The chat room wants to know when a member dies, but a member should not die because the room crashed. `monitor/2` is one-way. It returns a reference, and when the watched process ends the watcher gets one `'DOWN'` message.
+
+```erlang
+23> process_flag(trap_exit, false).
+true
+24> P = spawn(fun() -> receive stop -> ok end end).
+<0.119.0>
+25> Ref = monitor(process, P).
+#Ref<0.912032649.1470627848.93010>
+26> P ! stop.
+stop
+27> flush().
+Shell got {'DOWN',#Ref<0.912032649.1470627848.93010>,process,<0.119.0>,normal}
+ok
+```
+
+The message is `{'DOWN', Ref, process, Pid, Reason}`. The watcher is never killed, and the watched process is not affected. Monitoring a pid that is already dead is safe. The message arrives at once with reason `noproc`.
+
+`spawn_monitor/1` spawns and monitors in one step and returns `{Pid, Ref}`. `demonitor(Ref, [flush])` cancels a monitor. The `flush` option also removes a `'DOWN'` message that is already waiting in the mailbox.
+
+| | Link | Monitor |
+| --- | --- | --- |
+| Direction | both ways | watcher to watched |
+| On abnormal death | the other process dies, or gets `'EXIT'` if it traps | watcher gets `'DOWN'` |
+| Use when | the processes cannot work without each other | one side needs to clean up or report |
+
+## A Room That Forgets Dead Members
+
+The room monitors every process that joins and stores the reference next to the name.
+
+**Update `chat_room.erl`:**
+
+```erlang
+%% In chat_room.erl, replace loop/1 and send_all/2
+loop(Members) ->
+    receive
+        {join, Pid, Name} ->
+            Ref = monitor(process, Pid),
+            send_all(Members, {chat, "room", Name ++ " joined"}),
+            loop([{Pid, Name, Ref} | Members]);
+        {leave, Pid} ->
+            case lists:keyfind(Pid, 1, Members) of
+                {Pid, _Name, Ref} -> demonitor(Ref, [flush]);
+                false -> ok
+            end,
+            loop(lists:keydelete(Pid, 1, Members));
+        {'DOWN', _Ref, process, Pid, _Reason} ->
+            case lists:keytake(Pid, 1, Members) of
+                {value, {Pid, Name, _}, Rest} ->
+                    send_all(Rest, {chat, "room", Name ++ " disconnected"}),
+                    loop(Rest);
+                false ->
+                    loop(Members)
+            end;
+        {broadcast, Pid, Text} ->
+            case lists:keyfind(Pid, 1, Members) of
+                {Pid, Name, _} -> send_all(Members, {chat, Name, Text});
+                false -> ignored
+            end,
+            loop(Members);
+        {call, From, Ref, members} ->
+            From ! {Ref, lists:sort([Name || {_Pid, Name, _Ref} <- Members])},
+            loop(Members)
+    end.
+
+send_all(Members, Message) ->
+    [Pid ! Message || {Pid, _Name, _Ref} <- Members],
+    ok.
+```
+
+`lists:keytake/3` returns the matching tuple and the rest of the list. A member who leaves is demonitored, so no `'DOWN'` arrives for them later.
+
+```erlang
+1> c(chat_room).
+{ok,chat_room}
+2> Room = chat_room:start().
+<0.91.0>
+3> chat_room:join(Room, "alice").
+ok
+4> Bob = spawn(fun() -> chat_room:join(Room, "bob"), receive stop -> ok end end).
+<0.94.0>
+5> chat_room:members(Room).
+["alice","bob"]
+6> exit(Bob, kill).
+true
+7> chat_room:members(Room).
+["alice"]
+8> flush().
+Shell got {chat,"room","bob joined"}
+Shell got {chat,"room","bob disconnected"}
+ok
+```
+
+## Keeping a Worker Alive
+
+Links and `trap_exit` are enough to restart a failed process. The keeper starts a worker with `spawn_link`, waits for its `'EXIT'` message, and starts a new one unless the exit was normal.
+
+**Create `keeper.erl`:**
+
+```erlang
+-module(keeper).
+-export([start/1, init/1]).
+
+start(WorkerFun) ->
+    spawn(?MODULE, init, [WorkerFun]).
+
+init(WorkerFun) ->
+    process_flag(trap_exit, true),
+    loop(WorkerFun, spawn_link(WorkerFun)).
+
+loop(WorkerFun, Worker) ->
+    receive
+        {'EXIT', Worker, normal} ->
+            io:format("worker finished, keeper stops~n");
+        {'EXIT', Worker, Reason} ->
+            io:format("worker died: ~p. restarting~n", [Reason]),
+            loop(WorkerFun, spawn_link(WorkerFun))
+    end.
+```
+
+The worker registers a name, because its pid changes with every restart. It crashes when `Text` is not a string.
+
+**Create `echo.erl`:**
+
+```erlang
+-module(echo).
+-export([run/0]).
+
+run() ->
+    register(echo, self()),
+    loop().
+
+loop() ->
+    receive
+        {From, Text} ->
+            From ! {echo, Text ++ "!"},
+            loop();
+        stop ->
+            ok
+    end.
+```
+
+```erlang
+1> c(keeper), c(echo).
+{ok,echo}
+2> Keeper = keeper:start(fun echo:run/0).
+<0.95.0>
+3> whereis(echo).
+<0.96.0>
+4> echo ! {self(), 42}.
+worker died: {badarg,[{erlang,'++',
+                              [42,"!"],
+                              [{error_info,#{module => erl_erts_errors}}]},
+                      {echo,loop,0,[{file,"echo.erl"},{line,11}]}]}. restarting
+{<0.84.0>,42}
+5> whereis(echo).
+<0.99.0>
+6> echo ! {self(), "still there?"}.
+{<0.84.0>,"still there?"}
+7> flush().
+Shell got {echo,"still there?!"}
+ok
+```
+
+The VM also prints an error report, left out here. The worker has no `try ... catch` and no input validation. It crashed on bad input and was back at once under a new pid. This is "let it crash" from lesson 07 with the missing half filled in.
+
+The keeper is a toy. A worker that crashes on startup is restarted in a tight loop forever. It manages one worker, and nothing watches the keeper itself. OTP supervisors solve this, and lesson 14 covers them.
+
+## Exercises
+
+**Exercise 1: Wait for a Result or a Crash**
+
+Write `run/1`. It runs a fun in a new process with `spawn_monitor` and returns `{ok, Result}` or `{error, Reason}`. The worker sends its result to the parent before it exits.
+
+```erlang
+% safe_run.erl exports run/1
+% Expected:
+% safe_run:run(fun() -> 6 * 7 end) returns {ok,42}
+% safe_run:run(fun() -> exit(boom) end) returns {error,boom}
+```
+
+**Exercise 2: Shared Fate**
+
+Spawn a chain of three linked processes that all sleep forever. Kill the middle one with `exit(Pid, kill)` and check all three with `is_process_alive/1`. Then make the first process trap exits and print what it receives.
+
+```erlang
+% Expected: all three are dead in the first run.
+% In the second run the first process prints {'EXIT', Pid, killed} and survives.
+```
+
+**Exercise 3: Restart Limit**
+
+Give `keeper` a restart budget. `start/2` takes the fun and a maximum restart count. When the budget is used up, the keeper exits with reason `too_many_restarts`.
+
+```erlang
+loop(WorkerFun, Worker, RestartsLeft) ->
+    todo.
+
+% Expected: keeper:start(fun() -> exit(bad) end, 3) prints three restarts
+% and then the keeper process is no longer alive
+```
+
+## Key Takeaways
+
+- **Links are symmetric**. An abnormal exit on either side kills the other side, and `normal` exits do not
+- **`spawn_link`** creates the process and the link atomically, which `spawn` plus `link/1` cannot do
+- **`process_flag(trap_exit, true)`** turns exit signals into `{'EXIT', Pid, Reason}` messages so a process can react and keep running
+- **`exit(Pid, Reason)`** stops another process. `kill` cannot be trapped and shows up as `killed`
+- **Monitors are one-way**. The watcher gets one `{'DOWN', Ref, process, Pid, Reason}` message and neither side is killed
+- **`demonitor(Ref, [flush])`** cancels a monitor and removes a `'DOWN'` that already arrived
+- **A process that traps exits and respawns its worker** is the core idea of a supervisor
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l10_trap_exit_reason",
+      question: "The shell traps exits and the linked process exits with reason oops. Which reason arrives in the 'EXIT' message?",
+      code: "process_flag(trap_exit, true).\nPid = spawn_link(fun() -> exit(oops) end).\nreceive {'EXIT', Pid, Reason} -> Reason after 1000 -> timeout end.\n% => ___",
+      answer: "oops",
+      hint: "The exit signal carries the exit reason of the dead process.",
+      explanation: "With trap_exit set, the signal becomes the message {'EXIT', Pid, oops} instead of killing the receiver."
+    },
+    {
+      id: "l10_down_tag",
+      question: "Which atom tags the message a monitor delivers when the watched process ends?",
+      code: "{Pid, Ref} = spawn_monitor(fun() -> exit(socket_closed) end).\nreceive {'___', Ref, process, Pid, Reason} -> Reason after 1000 -> timeout end.\n% => socket_closed",
+      answer: "DOWN",
+      hint: "Links deliver 'EXIT'. Monitors deliver something else.",
+      explanation: "A monitor message has the form {'DOWN', Ref, process, Pid, Reason}."
+    },
+    {
+      id: "l10_trap_flag",
+      question: "Which process flag lets the keeper receive 'EXIT' messages instead of dying with its worker?",
+      code: "init(WorkerFun) ->\n    process_flag(___, true),\n    loop(WorkerFun, spawn_link(WorkerFun)).\n\nloop(WorkerFun, Worker) ->\n    receive\n        {'EXIT', Worker, normal} -> ok;\n        {'EXIT', Worker, _Reason} -> loop(WorkerFun, spawn_link(WorkerFun))\n    end.",
+      answer: "trap_exit",
+      hint: "The flag is named after what it does to exit signals.",
+      explanation: "With trap_exit set to true, exit signals from linked processes arrive as messages."
+    },
+    {
+      id: "l10_kill_reason",
+      question: "A process is stopped with exit(Pid, kill). Which reason does its monitor report?",
+      code: "{Pid, Ref} = spawn_monitor(fun() ->\n    process_flag(trap_exit, true),\n    timer:sleep(infinity)\nend).\nexit(Pid, kill).\nreceive {'DOWN', Ref, process, Pid, Reason} -> Reason after 1000 -> timeout end.\n% => ___",
+      answer: "killed",
+      hint: "The reason changes on the way so that it does not spread as another untrappable kill.",
+      explanation: "kill cannot be trapped, and the victim exits with reason killed."
+    },
+    {
+      id: "l10_monitor_dead",
+      question: "The process is already dead when it is monitored. Which reason does the 'DOWN' message carry?",
+      code: "Pid = spawn(fun() -> ok end).\ntimer:sleep(100).\nRef = monitor(process, Pid).\nreceive {'DOWN', Ref, process, Pid, Reason} -> Reason after 1000 -> timeout end.\n% => ___",
+      answer: "noproc",
+      hint: "Short for no process.",
+      explanation: "Monitoring a dead pid is safe. The 'DOWN' message arrives immediately with reason noproc."
+    },
+    {
+      id: "l10_demonitor_flush",
+      question: "Which option makes demonitor also remove a 'DOWN' message that is already in the mailbox?",
+      code: "{Pid, Ref} = spawn_monitor(fun() -> ok end).\ntimer:sleep(100).\ndemonitor(Ref, [___]).\nreceive {'DOWN', Ref, process, Pid, _} -> got_down after 100 -> nothing end.\n% => nothing",
+      answer: "flush",
+      hint: "The shell has a function with the same name that empties the mailbox.",
+      explanation: "The process died before demonitor ran, so 'DOWN' was already queued. The flush option removes it."
+    },
+  ]}
+/>

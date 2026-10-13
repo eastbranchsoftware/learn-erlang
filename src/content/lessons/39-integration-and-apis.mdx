@@ -1,0 +1,428 @@
+---
+title: "Integration and APIs"
+description: "Add an HTTP JSON API next to the WebSocket endpoint so bots can read and post messages, and call webhooks when users chat"
+postNumber: 39
+publishDate: 2026-09-19T00:00:00Z
+tags: ["advanced", "http", "api"]
+difficulty: "advanced"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+Lesson 38 let code inside the VM subscribe to chat events. A deploy script or a dashboard lives outside the VM and speaks HTTP and JSON, not WebSocket. We'll add a small API for such callers, and webhooks for the opposite direction.
+
+## Reading a Request Body
+
+`chat_http:parse_request/1` from lesson 16 stops at the end of the headers. A POST carries a body after them, and `content-length` says how many bytes it has. TCP ignores that boundary, so the headers can arrive with half of the body, or none of it.
+
+**Update `src/chat_http.erl`:**
+
+```erlang
+%% In src/chat_http.erl. Export body/2 and add -define(MAX_BODY, 65536).
+%% Returns {ok, Body, Rest}, more, or {error, Status}.
+body(#{method := Method, headers := Headers}, Rest) ->
+    case maps:find(<<"content-length">>, Headers) of
+        {ok, Value} ->
+            try binary_to_integer(Value) of
+                Length when Length < 0 -> {error, 400};
+                Length when Length > ?MAX_BODY -> {error, 413};
+                Length when byte_size(Rest) >= Length ->
+                    <<Body:Length/binary, Rest2/binary>> = Rest,
+                    {ok, Body, Rest2};
+                _Length -> more
+            catch
+                error:badarg -> {error, 400}
+            end;
+        error when Method =:= 'POST'; Method =:= 'PUT' ->
+            {error, 411};
+        error ->
+            {ok, <<>>, Rest}
+    end.
+
+%% New clauses for reason/1
+reason(201) -> <<"Created">>;
+reason(411) -> <<"Length Required">>;
+reason(413) -> <<"Payload Too Large">>;
+```
+
+The 413 check comes before the size check, so a client announcing 2 GB gets its answer at once and we never buffer more than 64 KB. A POST without `content-length` gets 411, which also covers chunked uploads. A GET gets an empty body.
+
+**Update `src/chat_connection.erl`:**
+
+```erlang
+%% In src/chat_connection.erl, the http clause of process/1.
+%% Replace the {ok, Request, Rest} branch.
+        {ok, Request, Rest} ->
+            case chat_http:body(Request, Rest) of
+                {ok, Body, Rest2} ->
+                    handle_request(Request#{body => Body}, State#state{buffer = Rest2});
+                more ->
+                    activate(State);
+                {error, Status} ->
+                    respond(Status, <<"application/json">>,
+                            json:encode(#{error => bad_body}), State)
+            end;
+```
+
+This `more` keeps the whole buffer, headers included, and the phase stays `http`. The next `{tcp, ...}` message appends to it and `process/1` parses again from the start. Parsing headers twice is cheap and the state needs no new field.
+
+## Routing Is Pattern Matching
+
+A path like `/api/rooms/erlang/messages?limit=5` becomes `[<<"api">>, <<"rooms">>, <<"erlang">>, <<"messages">>]`. Cut the query string off, then split on the slash. `trim_all` drops the empty binary before the leading slash, and one after a trailing slash.
+
+The router is a function whose clauses match on the method and that list. A variable in the list is a path parameter.
+
+**Create `src/chat_api.erl`:**
+
+```erlang
+-module(chat_api).
+-export([segments/1, handle/4]).
+
+segments(Path) ->
+    [PathOnly | _Query] = binary:split(Path, <<"?">>),
+    binary:split(PathOnly, <<"/">>, [global, trim_all]).
+
+handle(Method, Segments, Req, Body) ->
+    case authenticate(Req) of
+        {ok, Bot} -> route(Method, Segments, Bot, Body);
+        error -> {401, #{error => unauthorized}}
+    end.
+
+%%% The routing table
+
+route('GET', [<<"api">>, <<"rooms">>], _Bot, _Body) ->
+    Rooms = [#{name => Name, members => length(chat_room:members(Name))}
+             || Name <- chat_rooms:list_rooms()],
+    {200, #{rooms => Rooms}};
+route('GET', [<<"api">>, <<"rooms">>, Room, <<"messages">>], _Bot, _Body) ->
+    case chat_room:history(Room) of
+        {ok, History} -> {200, #{room => Room, messages => History}};
+        {error, no_room} -> not_found()
+    end;
+route('POST', [<<"api">>, <<"rooms">>, Room, <<"messages">>], Bot, Body) ->
+    post_message(Room, <<"bot:", Bot/binary>>, Body);
+route(_Method, [<<"api">>, <<"rooms">>], _Bot, _Body) ->
+    {405, #{error => method_not_allowed}};
+route(_Method, [<<"api">>, <<"rooms">>, _Room, <<"messages">>], _Bot, _Body) ->
+    {405, #{error => method_not_allowed}};
+route(_Method, _Segments, _Bot, _Body) ->
+    not_found().
+
+not_found() ->
+    {404, #{error => not_found}}.
+
+post_message(Room, From, Body) ->
+    try json:decode(Body) of
+        #{<<"text">> := Text} when is_binary(Text), Text =/= <<>> ->
+            case chat_room:post_as_bot(Room, From, Text) of
+                ok -> {201, #{status => posted, room => Room, from => From}};
+                {error, no_room} -> not_found()
+            end;
+        _Other ->
+            {400, #{error => missing_text}}
+    catch
+        error:_ -> {400, #{error => invalid_json}}
+    end.
+
+%%% Bearer tokens
+
+authenticate(#{headers := #{<<"authorization">> := <<"Bearer ", Token/binary>>}}) ->
+    Tokens = application:get_env(chat_server, api_tokens, []),
+    case [Bot || {Known, Bot} <- Tokens,
+                 byte_size(Known) =:= byte_size(Token),
+                 crypto:hash_equals(Known, Token)] of
+        [Bot | _] -> {ok, Bot};
+        [] -> error
+    end;
+authenticate(_Req) ->
+    error.
+```
+
+`handle/4` returns a status and a term and never touches a socket, so the caller encodes every result as JSON in one place. A known path with the wrong method falls through to a 405 clause, anything else to 404.
+
+Every call needs `Authorization: Bearer TOKEN`, and one binary pattern checks the scheme and extracts the token. `crypto:hash_equals/2` compares in constant time as in lesson 21, so response time does not reveal how many leading bytes were right. It raises `badarg` for binaries of different sizes, so the length check runs first. Tokens map to bot names in the application environment.
+
+```erlang
+%% In src/chat_server.app.src
+  {applications, [kernel, stdlib, crypto, mnesia, ssl, inets]},
+  {env, [
+      {port, 8080},
+      {api_tokens, [{<<"s3cr3t-deploy-token">>, <<"deploy">>}]},
+      {webhook_urls, ["http://localhost:9000/hook"]}
+  ]}
+```
+
+That is the full list after every lesson so far, so check yours against it. `mnesia` arrived in lesson 28 and `ssl` in lesson 34, and dropping either breaks a release even though `rebar3 shell` still works. Keep real tokens in `sys.config` (lesson 25), not in git. `inets` is for the webhooks below.
+
+## Bots in a Room
+
+`chat_room:send_message/3` answers `{error, not_member}` to outsiders, and a bot has no connection process that could join. Rather than fake a member, `post_as_bot/3` skips the membership check, and only `chat_api` calls it, after the token check. The `bot:` prefix cannot impersonate a user, because `chat_auth` rejects a colon in usernames.
+
+Neither new function may start a room, or every guessed URL would create a process.
+
+**Update `src/chat_rooms.erl`** and **`src/chat_room.erl`:**
+
+```erlang
+%% In src/chat_rooms.erl. Export find_room/1.
+find_room(Name) ->
+    gen_server:call(?MODULE, {find_room, Name}).
+
+handle_call({find_room, Name}, _From, Rooms) ->
+    case maps:find(Name, Rooms) of
+        {ok, {Pid, _Ref}} -> {reply, {ok, Pid}, Rooms};
+        error -> {reply, {error, no_room}, Rooms}
+    end;
+
+%% In src/chat_room.erl. Export history/1 and post_as_bot/3.
+history(Room) ->
+    call_existing(Room, history).
+
+post_as_bot(Room, Bot, Text) ->
+    call_existing(Room, {bot_message, Bot, Text}).
+
+call_existing(Room, Request) ->
+    case chat_rooms:find_room(Room) of
+        {ok, Pid} -> gen_server:call(Pid, Request);
+        {error, no_room} -> {error, no_room}
+    end.
+
+%% The true branch of the message clause shrinks to
+        true -> {reply, ok, deliver(Sender, Text, State)};
+%% and these clauses are new.
+handle_call({bot_message, Bot, Text}, _From, State) ->
+    {reply, ok, deliver(Bot, Text, State)};
+handle_call(history, _From, #{history := History} = State) ->
+    {reply, {ok, lists:reverse(History)}, State};
+
+deliver(From, Text, #{name := Name} = State) ->
+    Event = #{type => message, room => Name, from => From, text => Text},
+    publish(Event, State),
+    ok = chat_store:save_message(Name, From, Text),
+    chat_events:notify({message, Name, From, Text}),
+    remember(Event, State).
+```
+
+Both message paths now meet in `deliver/3`, so a bot message travels as far as a person's. It reuses `publish/2` and `remember/2` from lesson 31, which reach the same room on other nodes, saves with `chat_store:save_message/3` from lesson 28, and announces with `chat_events:notify/1` from lesson 38. Drop the line for any lesson you skipped. To serve more than 50 messages, answer the GET route from `chat_store:recent_messages(Room, N)`.
+
+The connection needs one new clause. Put it above the 404 clause, next to `/health` from lesson 36.
+
+```erlang
+%% In src/chat_connection.erl
+handle_request(#{method := Method, path := <<"/api/", _/binary>> = Path, body := Body} = Request,
+               State) ->
+    {Status, Json} =
+        try chat_api:handle(Method, chat_api:segments(Path), Request, Body)
+        catch _:_ -> {500, #{error => internal_error}}
+        end,
+    respond(Status, <<"application/json">>, json:encode(Json), State);
+```
+
+## Trying It with curl
+
+Log in as `alice` in the browser, join `erlang` and say hello. Then play the bot.
+
+```bash
+$ curl -H "Authorization: Bearer s3cr3t-deploy-token" localhost:8080/api/rooms
+{"rooms":[{"name":"erlang","members":1},{"name":"lobby","members":1}]}
+$ curl -i -X POST -H "Authorization: Bearer s3cr3t-deploy-token" \
+    -d '{"text": "Deploy 1.4.2 finished"}' localhost:8080/api/rooms/erlang/messages
+HTTP/1.1 201 Created
+...
+{"status":"posted","room":"erlang","from":"bot:deploy"}
+$ curl -H "Authorization: Bearer s3cr3t-deploy-token" localhost:8080/api/rooms/erlang/messages
+{"messages":[{"type":"message","text":"hello from the browser","room":"erlang","from":"alice"},{"type":"message","text":"Deploy 1.4.2 finished","room":"erlang","from":"bot:deploy"}],"room":"erlang"}
+```
+
+Alice sees `bot:deploy: Deploy 1.4.2 finished` in her browser. Now the failures, with `$AUTH` for the header above and response headers trimmed.
+
+```bash
+$ curl -i -H "Authorization: Bearer wrong" localhost:8080/api/rooms
+HTTP/1.1 401 Unauthorized
+{"error":"unauthorized"}
+$ curl -i -H "$AUTH" localhost:8080/api/rooms/nosuch/messages
+HTTP/1.1 404 Not Found
+{"error":"not_found"}
+$ curl -i -X POST -H "$AUTH" -d '{"text": ' localhost:8080/api/rooms/erlang/messages
+HTTP/1.1 400 Bad Request
+{"error":"invalid_json"}
+```
+
+The room list still shows two rooms, so the 404 did not create `nosuch`.
+
+## Testing the Router
+
+The router needs no socket, so EUnit from lesson 23 can call it directly. This test covers the 405 case.
+
+**Create `test/chat_api_tests.erl`:**
+
+```erlang
+-module(chat_api_tests).
+-include_lib("eunit/include/eunit.hrl").
+
+request(Token) ->
+    application:set_env(chat_server, api_tokens, [{<<"t0ken">>, <<"ci">>}]),
+    #{headers => #{<<"authorization">> => <<"Bearer ", Token/binary>>}}.
+
+unknown_method_test() ->
+    ?assertMatch({405, _}, chat_api:handle('DELETE', [<<"api">>, <<"rooms">>],
+                                           request(<<"t0ken">>), <<>>)).
+```
+
+## Outbound Webhooks
+
+A webhook is the API turned around. When a user writes a message, we POST it as JSON to every URL in `webhook_urls`, using `httpc`, the HTTP client in the `inets` application.
+
+Lesson 38 warned that a slow handler blocks the event manager. A request can take five seconds, so the handler spawns a process per delivery and returns at once. With `spawn` instead of `spawn_link`, a crashing delivery cannot take the manager down.
+
+**Create `src/chat_webhook_handler.erl`:**
+
+```erlang
+-module(chat_webhook_handler).
+-behaviour(gen_event).
+
+-export([init/1, handle_event/2, handle_call/2]).
+
+init([]) ->
+    {ok, []}.
+
+%% Skip bot messages, or a bot that answers its own webhook loops forever.
+handle_event({message, _Room, <<"bot:", _/binary>>, _Text}, State) ->
+    {ok, State};
+handle_event({message, Room, From, Text}, State) ->
+    Event = #{type => message, room => Room, from => From, text => Text},
+    Body = iolist_to_binary(json:encode(Event)),
+    Urls = application:get_env(chat_server, webhook_urls, []),
+    [spawn(fun() -> post(Url, Body, 1) end) || Url <- Urls],
+    {ok, State};
+handle_event(_Event, State) ->
+    {ok, State}.
+
+handle_call(_Request, State) ->
+    {ok, ok, State}.
+
+post(Url, Body, Attempt) ->
+    Request = {Url, [], "application/json", Body},
+    HttpOptions = [{timeout, 5000}, {connect_timeout, 2000}],
+    case httpc:request(post, Request, HttpOptions, []) of
+        {ok, {{_Version, Status, _Phrase}, _Headers, _Body}} when Status >= 200, Status < 300 ->
+            ok;
+        _Failure when Attempt < 3 ->
+            timer:sleep(1000 * Attempt),
+            post(Url, Body, Attempt + 1);
+        Failure ->
+            logger:warning("webhook ~s dropped after ~p attempts: ~p", [Url, Attempt, Failure])
+    end.
+```
+
+Add `chat_webhook_handler => []` to the map in `chat_events_guard:init/1`, so it is supervised like the handlers in lesson 38. Then listen with `nc -l 9000` in a second terminal and write a chat message.
+
+```text
+$ nc -l 9000
+POST /hook HTTP/1.1
+content-type: application/json
+content-length: 81
+host: localhost:9000
+connection: keep-alive
+
+{"type":"message","text":"hello from the browser","room":"erlang","from":"alice"}
+```
+
+`nc` never answers, so stop it with Ctrl-C. The chat kept working meanwhile, and the retries find nobody listening.
+
+```text
+=WARNING REPORT==== 19-Sep-2026::11:01:31.615341 ===
+webhook http://localhost:9000/hook dropped after 3 attempts: {error,{failed_connect,...}}
+```
+
+Delivery is best effort. After three failures, or a node restart, the message is gone. A retry after a timeout can also reach a receiver that already handled the first attempt. Stronger guarantees need a queue on disk and event ids.
+
+## Exercises
+
+**Exercise 1: Pagination**
+
+Parse `?limit=N` with `uri_string:dissect_query/1` and return only the newest N messages. Answer 400 for anything but a positive integer.
+
+```erlang
+% curl -H "$AUTH" "localhost:8080/api/rooms/erlang/messages?limit=1"
+% Expected: only the newest message in "messages"
+```
+
+**Exercise 2: Rate limit the API**
+
+Reuse the token bucket from lesson 34 with one bucket per bot name. Add the reason phrase for 429.
+
+```erlang
+% Expected for the 11th POST within one second:
+% {429, #{error => rate_limited}}
+```
+
+**Exercise 3: Bound the webhook deliveries**
+
+A dead receiver keeps every delivery process alive for many seconds. Count running deliveries in the handler state with monitors, and drop new ones with a log line while 100 are in flight.
+
+```erlang
+% Expected: with nc holding connections open, never more than 100 delivery processes
+```
+
+## Key Takeaways
+
+- **Routes are function clauses.** Split the path into segments and match on the method and the list. Variables are path parameters
+- **Keep the router away from sockets.** `handle/4` returns `{Status, Term}`, so EUnit can test it and one place encodes JSON
+- **A body needs `content-length` bytes.** Answer `more` until `byte_size(Buffer) >= Length`, and reject oversized or missing lengths first
+- **Compare tokens in constant time.** Check the length first, because `crypto:hash_equals/2` raises `badarg` on different sizes
+- **Outbound calls run in their own process.** Timeouts and a bounded retry count keep a slow receiver away from the chat. Delivery is best effort, so log what you drop
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l39_segment_count",
+      question: "How many segments does the path split into when trim_all removes the empty ones?",
+      code: 'Segments = binary:split(<<"/api/rooms/lobby/">>, <<"/">>, [global, trim_all]).\nlength(Segments).\n% => ___',
+      answer: "3",
+      hint: "Without trim_all there would be an empty binary at each end.",
+      explanation: "trim_all drops the empty binaries at both ends, which leaves api, rooms and lobby."
+    },
+    {
+      id: "l39_bearer_pattern",
+      question: "Which type specifier makes Token match the rest of the header value?",
+      code: 'Header = <<"Bearer abc123">>.\n<<"Bearer ", Token/___>> = Header.\nToken.\n% => <<"abc123">>',
+      answer: "binary",
+      hint: "The last segment of a pattern may have this type without a size.",
+      explanation: "A trailing binary segment matches all remaining bytes, so one pattern checks the scheme and extracts the token."
+    },
+    {
+      id: "l39_route_status",
+      question: "Which status does the router return for DELETE on a known path?",
+      code: 'route(\'GET\', [<<"api">>, <<"rooms">>]) -> 200;\nroute(_Method, [<<"api">>, <<"rooms">>]) -> 405;\nroute(_Method, _Segments) -> 404.\n\nroute(\'DELETE\', [<<"api">>, <<"rooms">>]).\n% => ___',
+      answer: "405",
+      hint: "Clauses are tried from top to bottom.",
+      explanation: "The path matches but the method does not, so the second clause answers before the 404 catch-all."
+    },
+    {
+      id: "l39_body_more",
+      question: "The header announces 9 bytes and 4 have arrived. What does the check return?",
+      code: 'body_ready(Buffer, Header) ->\n    Length = binary_to_integer(Header),\n    case byte_size(Buffer) >= Length of\n        true -> ok;\n        false -> more\n    end.\n\nbody_ready(<<"{\\"te">>, <<"9">>).\n% => ___',
+      answer: "more",
+      hint: "byte_size of the buffer is 4.",
+      explanation: "4 >= 9 is false, so the connection keeps the buffer and waits for the next packet."
+    },
+    {
+      id: "l39_token_length",
+      question: "The tokens differ in length. What does the check return?",
+      code: 'Check = fun(Known, Token) ->\n    byte_size(Known) =:= byte_size(Token)\n        andalso crypto:hash_equals(Known, Token)\nend.\nCheck(<<"abc">>, <<"abcd">>).\n% => ___',
+      answer: "false",
+      hint: "andalso skips its right side when the left side is false.",
+      explanation: "The length test fails first, so hash_equals is never called. With different sizes it would raise badarg."
+    },
+    {
+      id: "l39_encode_error",
+      question: "Which atom produces this JSON error body?",
+      code: 'iolist_to_binary(json:encode(#{error => ___})).\n% => <<"{\\"error\\":\\"unauthorized\\"}">>',
+      answer: "unauthorized",
+      hint: "json:encode/1 writes atoms as JSON strings.",
+      explanation: "Atom keys and atom values both become JSON strings."
+    }
+  ]}
+/>

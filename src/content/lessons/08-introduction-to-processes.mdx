@@ -1,47 +1,329 @@
 ---
-title: "[Coming Soon] Introduction to Processes"
-description: "Discover Erlang's lightweight processes, the foundation of concurrent programming and the actor model that powers fault-tolerant systems"
+title: "Introduction to Processes"
+description: "Spawn lightweight Erlang processes, identify them by pid, and see why a crash in one process leaves the others running"
 postNumber: 8
-publishDate: 2025-07-09T00:00:00Z
+publishDate: 2026-09-19T00:00:00Z
 tags: ["intermediate", "processes", "concurrency"]
 difficulty: "intermediate"
 ---
 
-# Introduction to Processes
+import ErlangKoans from '../../components/ErlangKoans.astro';
 
-## Coming Soon
+Lesson 07 introduced "let it crash" and said that a failing process can be restarted by something else. That only works if a crash stays contained. Processes are the unit of containment in Erlang. Every piece of running code lives in one, including the shell you have been typing into.
 
-This lesson introduces Erlang's revolutionary process model - lightweight, isolated processes that communicate through message passing. You'll learn how to:
+## What a Process Is
 
-- Create and manage Erlang processes
-- Understand process isolation and fault containment
-- Implement the actor model for concurrent programming
-- Use spawn, self, and process identifiers (PIDs)
-- Build your first concurrent chat server components
+An Erlang process is not an operating system process or thread. The Erlang VM creates and schedules processes itself. It starts one scheduler thread per CPU core, and each scheduler runs many Erlang processes in turn, giving each a short slice of work before switching to the next. No process can hog a core, so one slow chat user cannot freeze the others.
 
-### What You'll Build
+Each process has its own small heap and stack. Processes share no memory. A variable bound in one process cannot be read or changed by another. The only way to get data from one process to another is to send a copy of it as a message. No shared memory means no locks, and it means a process can die without leaving corrupted data behind for others.
 
-By the end of this lesson, you'll have implemented:
+A new process starts with a few kilobytes of memory, so a system can run hundreds of thousands of them. That changes how you design programs. You do not pool processes or ration them. You create one for each independent activity.
 
-- Basic process creation and management
-- Simple message passing between processes
-- Process monitoring and lifecycle management
-- A foundation for concurrent chat server architecture
-- Your first actor-based components
+## Spawning a Process
 
-### Key Concepts Preview
+`spawn/1` takes a fun, starts a new process that runs it, and returns right away with a process identifier, or pid.
 
 ```erlang
-% Creating processes
-Pid = spawn(fun() -> chat_user_process() end),
-Pid ! {message, "Hello from another process"}.
-
-% Process isolation
-self() ! {internal_message, data}.
+1> self().
+<0.84.0>
+2> Pid = spawn(fun() -> io:format("Hello from ~p~n", [self()]) end).
+Hello from <0.87.0>
+<0.87.0>
 ```
 
-This lesson builds on the error handling patterns from Lesson 6 and prepares you for the inter-process communication we'll explore in Lesson 8.
+`self()` returns the pid of the process that calls it. The shell is process `<0.84.0>`. Inside the fun, `self()` returned `<0.87.0>`, which is the same value `spawn/1` handed back to the shell. Your numbers will differ. A pid is an ordinary value. You can bind it to a variable, store it in a tuple or a map, and send it to other processes.
 
----
+Real programs usually spawn a function from a module with `spawn/3`. It takes a module name, a function name, and a list of arguments. The function must be exported.
 
-_This lesson is currently under development. Check back soon for the complete content!_
+**Create `greeter.erl`:**
+
+```erlang
+-module(greeter).
+-export([greet/1]).
+
+greet(Name) ->
+    io:format("~p says hello to ~s~n", [self(), Name]).
+```
+
+```erlang
+3> c(greeter).
+{ok,greeter}
+4> greeter:greet("alice").
+<0.84.0> says hello to alice
+ok
+5> spawn(greeter, greet, ["alice"]).
+<0.96.0> says hello to alice
+<0.96.0>
+```
+
+Calling `greeter:greet/1` directly runs it in the shell process. Spawning it runs the same code in a new process. Code does not belong to a process. Any process can run any function.
+
+## Processes End When Their Function Returns
+
+A process lives exactly as long as the function it was spawned with. When that function returns, the process is gone and its memory is freed. `is_process_alive/1` tells you which state a pid is in.
+
+```erlang
+6> Sleeper = spawn(fun() -> timer:sleep(5000), io:format("done~n") end).
+<0.98.0>
+7> is_process_alive(Sleeper).
+true
+8> timer:sleep(5100).
+done
+ok
+9> is_process_alive(Sleeper).
+false
+```
+
+`timer:sleep/1` suspends only the calling process. The shell stayed usable while `Sleeper` slept. A process that should stay around, like a chat connection, runs a function that loops. Lesson 09 builds those loops.
+
+## Getting a Result Back
+
+The return value of a spawned function is thrown away. Nothing is waiting for it.
+
+```erlang
+10> spawn(fun() -> 21 * 2 end).
+<0.103.0>
+```
+
+The `42` went nowhere. To get a result out, the new process has to send it as a message. `Pid ! Message` sends, and `receive` waits for a message and pattern matches on it.
+
+```erlang
+11> Shell = self().
+<0.84.0>
+12> spawn(fun() -> Shell ! 21 * 2 end).
+<0.106.0>
+13> receive Answer -> Answer end.
+42
+```
+
+We bind `Shell` first because `self()` inside the fun would be the pid of the new process. The fun captures `Shell` in its closure, as funs did in lesson 04.
+
+Tagging the message with the sender's pid tells the receiver who answered.
+
+```erlang
+14> spawn(fun() -> Shell ! {self(), lists:sum(lists:seq(1, 1000000))} end).
+<0.109.0>
+15> receive {From, Sum} -> {From, Sum} end.
+{<0.109.0>,500000500000}
+```
+
+That is all the message passing this lesson needs. Lesson 09 covers mailboxes, timeouts, and receive loops.
+
+## Spawning 100,000 Processes
+
+`timer:tc/1` runs a fun and returns the elapsed microseconds with the result. We'll use it to measure what a process costs.
+
+**Create `spawn_bench.erl`:**
+
+```erlang
+-module(spawn_bench).
+-export([run/1, wait/0]).
+
+run(N) ->
+    Before = erlang:memory(processes),
+    {Micros, Pids} = timer:tc(fun() -> spawn_many(N) end),
+    After = erlang:memory(processes),
+    io:format("Spawned ~p processes in ~p ms~n", [N, Micros div 1000]),
+    io:format("~p microseconds per process~n", [Micros / N]),
+    io:format("~p bytes per process~n", [(After - Before) div N]),
+    io:format("Processes alive: ~p~n", [erlang:system_info(process_count)]),
+    [Pid ! stop || Pid <- Pids],
+    ok.
+
+spawn_many(N) ->
+    [spawn(?MODULE, wait, []) || _ <- lists:seq(1, N)].
+
+wait() ->
+    receive
+        stop -> ok
+    end.
+```
+
+Each process blocks in `receive` until it gets `stop`, so all of them are alive when we count. A process waiting in `receive` uses no CPU. The scheduler skips it until a message arrives.
+
+```erlang
+16> c(spawn_bench).
+{ok,spawn_bench}
+17> spawn_bench:run(100000).
+Spawned 100000 processes in 63 ms
+0.63584 microseconds per process
+2680 bytes per process
+Processes alive: 100044
+ok
+18> erlang:system_info(process_limit).
+1048576
+```
+
+Under a microsecond and about 2.7 KB each on this machine. The extra 44 processes are the shell and the VM's own system processes. The default limit is about a million and the `+P` flag to `erl` raises it.
+
+## Isolation
+
+Start one process that takes three seconds to finish and another that crashes right away.
+
+```erlang
+19> Survivor = spawn(fun() -> timer:sleep(3000), io:format("still here~n") end).
+<0.100120.0>
+20> Crasher = spawn(fun() -> 1 / 0 end).
+<0.100122.0>
+=ERROR REPORT==== 19-Sep-2026::10:10:45.490108 ===
+Error in process <0.100122.0> with exit value:
+{badarith,[{erlang,'/',[1,0],[{error_info,#{module => erl_erts_errors}}]}]}
+
+21> is_process_alive(Crasher).
+false
+22> is_process_alive(Survivor).
+true
+23> timer:sleep(3100).
+still here
+ok
+```
+
+The uncaught error killed `Crasher` and the VM logged a report. Nothing else happened. `Survivor` and the shell kept running. They had no memory in common with `Crasher`, so there was nothing for the crash to damage.
+
+This is what makes "let it crash" from lesson 07 practical. A process that hits a bug takes only its own state down with it. You do not need `try ... catch` around everything to protect the rest of the system. The process boundary already does that.
+
+The shell follows the same rule. An error in a shell expression kills the shell process, and a fresh one replaces it.
+
+```erlang
+24> self().
+<0.84.0>
+25> 1 / 0.
+** exception error: an error occurred when evaluating an arithmetic expression
+     in operator  '/'/2
+        called as 1 / 0
+26> self().
+<0.100130.0>
+```
+
+The pid changed. Something noticed the dead shell and started a new one. Lesson 10 shows how one process can detect that another has died.
+
+## One Process per User
+
+The chat server will give every connected user a process of their own. That process owns the user's socket and handles their messages. Because processes are cheap, ten thousand users means ten thousand processes, and the VM spreads them across all cores. Because processes are isolated, a malformed message that crashes one user's process disconnects that user and nobody else. Because each process handles one user, its code reads like a sequential program with no callbacks and no locks.
+
+## Exercises
+
+**Exercise 1: Parallel Squares**
+
+Write `squares:start/1`. It takes a list of numbers and spawns one process per number. Each process prints its own pid and the square of its number. Run it a few times and watch the order of the output.
+
+```erlang
+-module(squares).
+-export([start/1, square/1]).
+
+start(Numbers) ->
+    % spawn squares:square/1 for each number
+    ok.
+
+square(N) ->
+    % print self() and N * N
+    ok.
+
+% Expected: squares:start([1, 2, 3]) prints three lines such as
+% <0.95.0>: 1
+% <0.96.0>: 4
+% <0.97.0>: 9
+```
+
+**Exercise 2: Collect the Results**
+
+Change exercise 1 so each process sends `{self(), N * N}` back to the process that called `start/1`. Receive one message per spawned pid and return the squares in the original order. Match on each pid in turn inside the `receive` pattern.
+
+```erlang
+collect(Pids) ->
+    % for each Pid: receive {Pid, Square} -> Square end
+    [].
+
+% Expected: squares:start([1, 2, 3]) returns [1,4,9]
+```
+
+**Exercise 3: Find the Limit**
+
+Run `spawn_bench:run/1` with 10000, 100000, and 500000. Does the cost per process change? Then start the VM with `erl +P 2000000` and check `erlang:system_info(process_limit)`.
+
+```erlang
+% Expected: time and memory per process stay roughly constant
+```
+
+**Exercise 4: Contained Crashes**
+
+Spawn five processes from a list of inputs. Each one calls `list_to_integer/1` on its input and prints the result. Make two of the inputs invalid, such as `"abc"`.
+
+```erlang
+Inputs = ["1", "abc", "3", "x", "5"].
+% spawn one process per input
+% Expected: three printed integers, two error reports, and a working shell
+```
+
+## Key Takeaways
+
+- **Processes belong to the VM**, not the operating system. They start in under a microsecond and take a few kilobytes
+- **`spawn/1` and `spawn/3`** start a process and return its pid immediately without waiting for it
+- **A pid is a plain value** that you can store, compare, and send. `self()` gives the calling process its own pid
+- **A process ends when its function returns**. Its return value is discarded, so results travel back as messages
+- **No shared memory** means data moves between processes only by copying it into a message
+- **A crash stays inside one process**, which is what makes "let it crash" safe
+- **The chat server runs one process per connected user**
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l08_spawn_returns",
+      question: "spawn/1 returns a value right away. Which type test is true for it?",
+      code: "Conn = spawn(fun() -> ok end).\n___(Conn).\n% => true",
+      answer: "is_pid",
+      hint: "spawn returns a process identifier.",
+      explanation: "spawn/1 returns the pid of the new process, and is_pid/1 is the type test for pids."
+    },
+    {
+      id: "l08_self_function",
+      question: "Which function returns the pid of the process that calls it?",
+      code: "Shell = ___().\nspawn(fun() -> Shell ! {user, \"alice\"} end).\nreceive {user, Name} -> Name after 1000 -> timeout end.\n% => \"alice\"",
+      answer: "self",
+      hint: "The spawned process needs to know where to send its message.",
+      explanation: "self() evaluated in the shell is the shell's pid. The fun captures it and sends the message there."
+    },
+    {
+      id: "l08_alive_after_return",
+      question: "What does is_process_alive/1 return after the spawned function has returned?",
+      code: "Pid = spawn(fun() -> finished end).\ntimer:sleep(100).\nis_process_alive(Pid).\n% => ___",
+      answer: "false",
+      hint: "A process lives as long as its function runs.",
+      explanation: "The fun returned almost immediately, so the process was gone long before the check."
+    },
+    {
+      id: "l08_spawn3_args",
+      question: "spawn/3 takes a module, a function name, and a list of arguments. What does the spawned process send back?",
+      code: "Shell = self().\nspawn(erlang, send, [Shell, {sum, lists:sum([1, 2, 3])}]).\nreceive {sum, Total} -> Total after 1000 -> timeout end.\n% => ___",
+      answer: "6",
+      hint: "The argument list is evaluated before spawn is called.",
+      explanation: "The new process runs erlang:send(Shell, {sum, 6}), which does the same as Shell ! {sum, 6}."
+    },
+    {
+      id: "l08_isolated_crash",
+      question: "The first process crashes. What does the second process still deliver?",
+      code: "Shell = self().\nspawn(fun() -> error(connection_lost) end).\nspawn(fun() -> timer:sleep(100), Shell ! online end).\nreceive Status -> Status after 1000 -> timeout end.\n% => ___",
+      answer: "online",
+      hint: "Processes share nothing.",
+      explanation: "A crash in one spawned process does not affect the other process or the shell."
+    },
+    {
+      id: "l08_self_inside_fun",
+      question: "The spawned process sends its own pid. What does the comparison with the pid returned by spawn evaluate to?",
+      code: "Shell = self().\nPid = spawn(fun() -> Shell ! {hello, self()} end).\nreceive {hello, From} -> From =:= Pid after 1000 -> timeout end.\n% => ___",
+      answer: "true",
+      hint: "self() inside the fun runs in the new process.",
+      explanation: "Inside the fun, self() is the new process's pid, the same value spawn returned to the shell."
+    },
+    {
+      id: "l08_count_processes",
+      question: "Each spawned process reports in once. How many messages does the shell count?",
+      code: "Shell = self().\n[spawn(fun() -> Shell ! joined end) || _ <- lists:seq(1, 50)].\nCount = fun Loop(N) ->\n    receive joined -> Loop(N + 1) after 200 -> N end\nend.\nCount(0).\n% => ___",
+      answer: "50",
+      hint: "One process per element of lists:seq(1, 50).",
+      explanation: "The comprehension spawns 50 processes and each sends exactly one message before it ends."
+    }
+  ]}
+/>

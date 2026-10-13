@@ -1,51 +1,378 @@
 ---
-title: "[Coming Soon] Basic Process Communication"
-description: "Learn message passing, process linking, and basic supervision patterns to build reliable concurrent systems for your chat server"
+title: "Basic Process Communication"
+description: "Send and receive messages between processes, keep state in a receive loop, and build a small chat room process"
 postNumber: 9
-publishDate: 2025-07-09T00:00:00Z
-tags: ["intermediate", "processes", "concurrency"]
+publishDate: 2026-09-19T00:00:00Z
+tags: ["intermediate", "processes", "message-passing"]
 difficulty: "intermediate"
 ---
 
-# Basic Process Communication
+import ErlangKoans from '../../components/ErlangKoans.astro';
 
-## Coming Soon
+Lesson 08 used `!` and `receive` just enough to get a result out of a spawned process. Processes share no memory, so messages are the only way they cooperate. Here we look at how messages are queued, matched, and answered, then build a chat room process.
 
-This lesson will teach you how processes communicate and coordinate in Erlang systems. You'll learn how to:
+## Mailboxes
 
-- Send and receive messages between processes
-- Implement synchronous and asynchronous communication patterns
-- Use process linking for fault propagation
-- Create basic supervision relationships
-- Build reliable message-passing protocols
-
-### What You'll Build
-
-By the end of this lesson, you'll have implemented:
-
-- A chat user process that handles messages
-- Process linking for fault tolerance
-- Basic supervision patterns
-- Message protocol design for chat operations
-- A foundation for the OTP patterns to come
-
-### Key Concepts Preview
+Every process has a mailbox, a queue of messages in arrival order. `Pid ! Message` copies the message into the mailbox of `Pid` and returns at once. The sender does not wait for the receiver to read it. The shell is a process, so it can mail itself, and `flush()` prints and removes everything in the shell's mailbox.
 
 ```erlang
-% Message passing
-UserPid ! {send_message, "Hello world"},
-receive
-    {message_sent, Result} -> handle_result(Result);
-    {error, Reason} -> handle_error(Reason)
-end.
-
-% Process linking
-link(UserPid),
-trap_exit(true).
+1> self() ! hello.
+hello
+2> self() ! {chat, "alice", "hi"}.
+{chat,"alice","hi"}
+3> flush().
+Shell got hello
+Shell got {chat,"alice","hi"}
+ok
 ```
 
-This lesson completes the Foundation Phase by building on the process creation from Lesson 7 and prepares you for the OTP principles we'll explore in Lesson 9.
+The value of a send expression is the message itself. Sending to a pid never fails, even when the process is gone.
 
----
+```erlang
+4> Dead = spawn(fun() -> ok end).
+<0.89.0>
+5> is_process_alive(Dead).
+false
+6> Dead ! are_you_there.
+are_you_there
+```
 
-_This lesson is currently under development. Check back soon for the complete content!_
+The message is dropped silently. This is deliberate. A process can die between a check and the send, so a check would prove nothing. If you need to know that a message was handled, ask for a reply.
+
+## Receiving with Patterns
+
+`receive` has clauses like `case`. It takes a message out of the mailbox, binds the variables of the matching clause, and runs its body. If the mailbox is empty, the process sleeps until a message arrives.
+
+```erlang
+7> Pid = spawn(fun() ->
+7>     receive
+7>         {chat, From, Text} -> io:format("~s says ~s~n", [From, Text]);
+7>         Other -> io:format("unexpected: ~p~n", [Other])
+7>     end
+7> end).
+<0.93.0>
+8> Pid ! {chat, "alice", "hi"}.
+alice says hi
+{chat,"alice","hi"}
+9> is_process_alive(Pid).
+false
+```
+
+One `receive` handles one message. The fun then returned, so the process ended.
+
+## Selective Receive
+
+`receive` does not always take the oldest message. It checks the oldest message against every clause. If none match, that message stays in the mailbox and the next one is tried. This is called selective receive.
+
+```erlang
+10> self() ! first, self() ! second, self() ! third.
+third
+11> receive third -> got_third end.
+got_third
+12> receive Msg -> Msg end.
+first
+13> flush().
+Shell got second
+ok
+```
+
+The skipped messages kept their order. Erlang guarantees that messages from one process to another arrive in the order they were sent. There is no guarantee about how messages from different senders interleave.
+
+Selective receive lets a process wait for one specific reply while unrelated messages queue up. The cost is that every `receive` scans from the front of the mailbox. If some messages never match, the mailbox grows and scans get slower, so long-running loops usually end with a catch-all clause that drops unknown messages.
+
+## Timeouts
+
+A `receive` for a message that never comes blocks forever. The `after` clause sets a limit in milliseconds.
+
+```erlang
+14> receive never_sent -> ok after 2000 -> timeout end.
+timeout
+```
+
+`after 0` checks the mailbox without waiting.
+
+```erlang
+15> self() ! leftover.
+leftover
+16> receive Any -> {got, Any} after 0 -> empty end.
+{got,leftover}
+17> receive Any2 -> {got, Any2} after 0 -> empty end.
+empty
+```
+
+## Loops That Hold State
+
+A process that should handle many messages calls itself after each one. Its state is the argument of the loop function. Variables never change. The next iteration gets a new value.
+
+**Create `counter.erl`:**
+
+```erlang
+-module(counter).
+-export([start/0, loop/1]).
+
+start() ->
+    spawn(?MODULE, loop, [0]).
+
+loop(Count) ->
+    receive
+        increment ->
+            loop(Count + 1);
+        {get, From} ->
+            From ! {count, Count},
+            loop(Count);
+        stop ->
+            ok
+    end.
+```
+
+Every call to `loop/1` is the last thing its clause does. That makes it a tail call, as in lesson 03, so the loop runs forever in constant stack space. The `stop` clause does not call `loop/1`, so the function returns and the process ends.
+
+```erlang
+18> c(counter).
+{ok,counter}
+19> C = counter:start().
+<0.110.0>
+20> C ! increment, C ! increment, C ! increment.
+increment
+21> C ! {get, self()}.
+{get,<0.84.0>}
+22> receive {count, N} -> N end.
+3
+```
+
+The count lives in exactly one process, and that process handles one message at a time. Two increments can never interleave, so there is nothing to lock.
+
+## Request and Reply
+
+`{get, self()}` shows the basic request pattern. The request carries the pid to reply to. The weak spot is the reply. A pattern like `{count, N}` matches any such message, including a late reply to an earlier request that timed out.
+
+`make_ref/0` returns a reference, a value that is unique in the running system. Put a fresh one in the request, have the server copy it into the reply, and match on it.
+
+```erlang
+23> Server = spawn(fun() ->
+23>     receive {From, Ref, {add, A, B}} -> From ! {Ref, A + B} end
+23> end).
+<0.118.0>
+24> Ref = make_ref().
+#Ref<0.2733087087.2544107521.156637>
+25> Server ! {self(), Ref, {add, 2, 3}}.
+{<0.84.0>,#Ref<0.2733087087.2544107521.156637>,{add,2,3}}
+26> self() ! {make_ref(), 999}.
+{#Ref<0.2733087087.2544107521.156656>,999}
+27> receive {Ref, Result} -> Result after 1000 -> timeout end.
+5
+```
+
+`Ref` is already bound, so the pattern `{Ref, Result}` only matches a tuple carrying that exact reference. The stray message from line 26 stays in the mailbox.
+
+## Registered Names
+
+Passing pids around gets awkward for long-lived services. `register/2` gives a process a name, an atom that works in place of the pid when sending. `whereis/1` looks the pid up.
+
+```erlang
+28> register(hits, counter:start()).
+true
+29> hits ! increment.
+increment
+30> whereis(hits).
+<0.125.0>
+31> hits ! stop.
+stop
+32> whereis(hits).
+undefined
+```
+
+The name disappears when the process ends. Unlike sending to a dead pid, sending to a name nobody holds raises `badarg`. Atoms are never garbage collected, so name a few well-known processes, not one per user.
+
+## A Chat Room Process
+
+A chat room is a loop whose state is the member list, kept as `{Pid, Name}` tuples. Callers should not need to know the message formats, so the module wraps each one in a function.
+
+**Create `chat_room.erl`:**
+
+```erlang
+-module(chat_room).
+-export([start/0, join/2, leave/1, broadcast/2, members/1]).
+-export([loop/1]).
+
+start() ->
+    spawn(?MODULE, loop, [[]]).
+
+join(Room, Name) ->
+    Room ! {join, self(), Name},
+    ok.
+
+leave(Room) ->
+    Room ! {leave, self()},
+    ok.
+
+broadcast(Room, Text) ->
+    Room ! {broadcast, self(), Text},
+    ok.
+
+members(Room) ->
+    call(Room, members).
+
+call(Room, Request) ->
+    Ref = make_ref(),
+    Room ! {call, self(), Ref, Request},
+    receive
+        {Ref, Reply} -> Reply
+    after 5000 ->
+        {error, timeout}
+    end.
+
+loop(Members) ->
+    receive
+        {join, Pid, Name} ->
+            send_all(Members, {chat, "room", Name ++ " joined"}),
+            loop([{Pid, Name} | Members]);
+        {leave, Pid} ->
+            loop(lists:keydelete(Pid, 1, Members));
+        {broadcast, Pid, Text} ->
+            case lists:keyfind(Pid, 1, Members) of
+                {Pid, Name} -> send_all(Members, {chat, Name, Text});
+                false -> ignored
+            end,
+            loop(Members);
+        {call, From, Ref, members} ->
+            From ! {Ref, lists:sort([Name || {_Pid, Name} <- Members])},
+            loop(Members)
+    end.
+
+send_all(Members, Message) ->
+    [Pid ! Message || {Pid, _Name} <- Members],
+    ok.
+```
+
+The API functions run in the caller's process, so `self()` there is the caller's pid. `loop/1` runs in the room process. `join`, `leave`, and `broadcast` send and return without waiting. `members/1` needs an answer, so it goes through `call/2`, which sends a reference and waits up to five seconds for the matching reply.
+
+```erlang
+1> c(chat_room).
+{ok,chat_room}
+2> Room = chat_room:start().
+<0.91.0>
+3> chat_room:join(Room, "alice").
+ok
+4> Bob = spawn(fun() ->
+4>     chat_room:join(Room, "bob"),
+4>     receive {chat, "alice", Text} -> io:format("bob got: ~s~n", [Text]) end
+4> end).
+<0.94.0>
+5> chat_room:members(Room).
+["alice","bob"]
+6> chat_room:broadcast(Room, "hello room").
+bob got: hello room
+ok
+7> flush().
+Shell got {chat,"room","bob joined"}
+Shell got {chat,"alice","hello room"}
+ok
+8> is_process_alive(Bob).
+false
+9> chat_room:members(Room).
+["alice","bob"]
+```
+
+Bob's process ended after one message, but the room still lists him and keeps sending to a dead pid. Sends never fail, so the room cannot notice. Lesson 10 fixes this.
+
+## Exercises
+
+**Exercise 1: Ping Pong**
+
+Write a `pong` process that answers every `{ping, From}` with `pong` and stops on `stop`. Then write `ping/2`, which sends N pings, waits for each reply, and returns how many it got.
+
+```erlang
+% pingpong.erl exports start/0, ping/2 and loop/0
+% Expected:
+% P = pingpong:start().
+% pingpong:ping(P, 3) returns 3
+```
+
+**Exercise 2: Synchronous Counter**
+
+Add API functions to `counter.erl` so callers never write a message by hand. `value/1` must use a reference and return `{error, timeout}` after one second.
+
+```erlang
+increment(Counter) -> ok.
+value(Counter) -> 0.
+
+% Expected:
+% C = counter:start(), counter:increment(C), counter:value(C) returns 1
+% counter:value(spawn(fun() -> ok end)) returns {error,timeout}
+```
+
+**Exercise 3: Message Count**
+
+Extend `chat_room` so the room counts broadcasts. Add `message_count/1` as a second synchronous call. The loop state becomes two arguments or a tuple.
+
+```erlang
+% Expected: after two broadcasts from a member
+% chat_room:message_count(Room) returns 2
+```
+
+## Key Takeaways
+
+- **`!` is asynchronous**. It copies the message into the receiver's mailbox and returns at once, even if the pid is dead
+- **`receive` pattern matches** against the mailbox and leaves messages that match no clause where they are
+- **Message order is kept** between one sender and one receiver. Nothing is promised across different senders
+- **`after`** puts a time limit on waiting. `after 0` polls the mailbox
+- **State is the argument of a tail-recursive loop**. One process owns it, so no locks are needed
+- **A fresh reference from `make_ref/0`** ties a reply to its request
+- **`register/2`** names a long-lived process. Sending to an unregistered name is an error
+- **API functions hide the message protocol** so callers only see ordinary function calls
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l09_send_returns",
+      question: "What is the value of a send expression?",
+      code: "Pid = spawn(fun() -> ok end).\nPid ! ping.\n% => ___",
+      answer: "ping",
+      hint: "The shell printed it after every send in this lesson.",
+      explanation: "A send evaluates to the message itself, whether or not anyone is there to receive it."
+    },
+    {
+      id: "l09_selective_receive",
+      question: "Two messages are waiting. Which one does the second receive return?",
+      code: "self() ! {chat, \"hello\"}.\nself() ! {system, \"restarting\"}.\nreceive {system, Notice} -> Notice after 1000 -> timeout end.\n% => \"restarting\"\nreceive {_Kind, Text} -> Text after 1000 -> timeout end.\n% => ___",
+      answer: '"hello"',
+      hint: "The first receive skipped a message. It is still in the mailbox.",
+      explanation: "Selective receive took the system message and left the chat message queued for the next receive."
+    },
+    {
+      id: "l09_loop_state",
+      question: "The loop keeps a count as its argument. What does the shell receive?",
+      code: "loop(Count) ->\n    receive\n        increment -> loop(Count + 1);\n        {get, From} -> From ! {count, Count}, loop(Count)\n    end.\n\nC = spawn(fun() -> loop(0) end).\nC ! increment.\nC ! increment.\nC ! {get, self()}.\nreceive {count, N} -> N after 1000 -> timeout end.\n% => ___",
+      answer: "2",
+      hint: "Both increments are handled before the get, because they were sent first.",
+      explanation: "Each increment calls loop with Count + 1, so the state is 2 when the get message is handled."
+    },
+    {
+      id: "l09_ref_match",
+      question: "Which variable in the receive pattern makes sure only the reply to this request matches?",
+      code: "Server = spawn(fun() ->\n    receive {From, Tag, users} -> From ! {Tag, [\"alice\"]} end\nend).\nRef = make_ref().\nself() ! {make_ref(), stale}.\nServer ! {self(), Ref, users}.\nreceive {___, Reply} -> Reply after 1000 -> timeout end.\n% => [\"alice\"]",
+      answer: "Ref",
+      hint: "A bound variable in a pattern must be equal to the incoming value.",
+      explanation: "Ref is already bound, so the stale message with a different reference is skipped."
+    },
+    {
+      id: "l09_register_name",
+      question: "Which function gives the process a name so the send on the next line works?",
+      code: "Pid = spawn(fun() ->\n    receive {From, ping} -> From ! pong end\nend).\n___(l09_pinger, Pid).\nl09_pinger ! {self(), ping}.\nreceive Reply -> Reply after 1000 -> timeout end.\n% => pong",
+      answer: "register",
+      hint: "It takes an atom and a pid.",
+      explanation: "register/2 associates the atom with the pid, and the atom can then be used as the target of a send."
+    },
+    {
+      id: "l09_dead_pid_send",
+      question: "The room process is already gone. What does the caller get after the timeout?",
+      code: "members(Room) ->\n    Ref = make_ref(),\n    Room ! {call, self(), Ref, members},\n    receive\n        {Ref, Reply} -> Reply\n    after 200 ->\n        {error, timeout}\n    end.\n\nRoom = spawn(fun() -> ok end).\nmembers(Room).\n% => {error, ___}",
+      answer: "timeout",
+      hint: "Sending to a dead pid does not fail. It also never produces a reply.",
+      explanation: "The send succeeds silently, no reply ever arrives, and the after clause returns the error tuple."
+    }
+  ]}
+/>

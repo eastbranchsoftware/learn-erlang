@@ -1,0 +1,351 @@
+---
+title: "Unit Testing with EUnit"
+description: "Write EUnit tests for the chat server's pure functions and for a running gen_server, with fixtures and no sleeps"
+postNumber: 23
+publishDate: 2026-09-19T00:00:00Z
+tags: ["advanced", "testing", "eunit"]
+difficulty: "advanced"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+The chat server has rooms, accounts and a wire protocol, and so far we checked every piece by typing into the shell. That stops working once a change can break code from five lessons ago. EUnit, the unit test framework that ships with OTP, turns those shell sessions into checks that run in a second.
+
+## Why Test When Processes Can Crash
+
+"Let it crash" handles faults. A supervisor restarts a process that hit a dropped socket or a bad message. It does nothing for code that is wrong. If `encode_frame/1` writes the wrong opcode, nothing crashes. Browsers drop the connection, and the supervisor sees a healthy system. Supervisors recover from faults, and tests prevent wrong behaviour.
+
+## The First Test Module
+
+rebar3 compiles the `test/` directory next to `src/` only when it runs tests, so test code never ends up in a release. By convention the tests for `chat_ws` live in `chat_ws_tests`. We start with pure functions, because they need no setup. The inputs are the RFC 6455 samples that lessons 17 and 18 tried in the shell.
+
+**Create `test/chat_ws_tests.erl`:**
+
+```erlang
+-module(chat_ws_tests).
+-include_lib("eunit/include/eunit.hrl").
+
+accept_key_test() ->
+    ?assertEqual(<<"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=">>,
+                 chat_ws:accept_key(<<"dGhlIHNhbXBsZSBub25jZQ==">>)).
+
+decode_unmasked_hello_test() ->
+    ?assertEqual({ok, {text, <<"Hello">>}, <<>>},
+                 chat_ws:decode_frame(<<16#81, 16#05, "Hello">>)).
+
+decode_masked_hello_test() ->
+    Frame = <<16#81, 16#85, 16#37, 16#fa, 16#21, 16#3d,
+              16#7f, 16#9f, 16#4d, 16#51, 16#58>>,
+    ?assertEqual({ok, {text, <<"Hello">>}, <<>>}, chat_ws:decode_frame(Frame)).
+
+encode_hello_test() ->
+    ?assertEqual(<<16#81, 16#05, "Hello">>,
+                 iolist_to_binary(chat_ws:encode_frame({text, <<"Hello">>}))).
+```
+
+There is no `-export` line. Including `eunit.hrl` exports every function whose name ends in `_test`. A test passes when it returns and fails when it raises an exception. The return value is ignored.
+
+```bash
+$ rebar3 eunit
+===> Performing EUnit tests...
+....
+Finished in 0.030 seconds
+4 tests, 0 failures
+```
+
+Each dot is one passing test. To see a failure, add a test with a mistake. The opcode for ping is 9, and this test expects `16#8A`, which is a pong.
+
+```erlang
+%% In test/chat_ws_tests.erl
+encode_ping_test() ->
+    ?assertEqual(<<16#8A, 0>>, iolist_to_binary(chat_ws:encode_frame({ping, <<>>}))).
+```
+
+```bash
+$ rebar3 eunit
+....F
+Failures:
+
+  1) chat_ws_tests:encode_ping_test/0
+     Failure/Error: ?assertEqual(<<138,0>>, iolist_to_binary ( chat_ws : encode_frame ( { ping , << >> } ) ))
+       expected: <<138,0>>
+            got: <<137,0>>
+     %% test/chat_ws_tests.erl:22:in `chat_ws_tests:encode_ping_test/0`
+
+Finished in 0.030 seconds
+5 tests, 1 failures
+===> Error running tests
+```
+
+The report shows the expression, both values and the line. The first argument of `?assertEqual` is the expected value, which is how the report can label them. Here the test was wrong, not the code. Change `16#8A` to `16#89` and the run passes again.
+
+## Assert Macros
+
+A plain match such as `ok = Result` also fails a test, but all you get is a `badmatch`. The macros report what was expected.
+
+| Macro | Passes when |
+| --- | --- |
+| `?assertEqual(Expected, Expr)` | the values are equal with `=:=` |
+| `?assertMatch(Pattern, Expr)` | the value matches the pattern, `_` allowed |
+| `?assert(Expr)`, `?assertNot(Expr)` | the value is `true`, or `false` |
+| `?assertError(Pattern, Expr)` | the expression raises an `error` that matches |
+| `?assertException(Class, Pattern, Expr)` | same, for any class (`throw`, `exit`, `error`) |
+
+Use `?assertMatch` when part of the result is unpredictable, such as a pid. A plain match is fine for preparation steps.
+
+## Test Generators
+
+The decoder has three length encodings, and bugs sit at the borders. A function whose name ends in `_test_` (note the trailing underscore) is a test generator. It does not run assertions. It returns tests, and EUnit runs and reports each one separately.
+
+Every assert macro has a generator form with a leading underscore. `?_assertEqual(A, B)` is short for `fun() -> ?assertEqual(A, B) end`, and `?_test(Expr)` wraps any expression. A `{Title, Test}` tuple names a test. A generator returns a list, so a comprehension can build it.
+
+```erlang
+%% In test/chat_ws_tests.erl
+round_trip_test_() ->
+    [{integer_to_list(Len) ++ " byte payload", ?_test(round_trip(Len))}
+     || Len <- [0, 1, 125, 126, 65535, 65536]].
+
+round_trip(Len) ->
+    Payload = binary:copy(<<"x">>, Len),
+    Encoded = iolist_to_binary(chat_ws:encode_frame({binary, Payload})),
+    ?assertEqual({ok, {binary, Payload}, <<>>}, chat_ws:decode_frame(Encoded)).
+
+truncated_frame_test_() ->
+    Frame = iolist_to_binary(chat_ws:encode_frame({text, binary:copy(<<"x">>, 200)})),
+    [?_assertEqual(more, chat_ws:decode_frame(binary:part(Frame, 0, N)))
+     || N <- lists:seq(0, byte_size(Frame) - 1)].
+
+bad_frames_test_() ->
+    [?_assertEqual({error, reserved_bits_set}, chat_ws:decode_frame(<<16#C1, 0>>)),
+     ?_assertMatch({error, {unknown_opcode, _}}, chat_ws:decode_frame(<<16#83, 0>>)),
+     ?_assertError(function_clause, chat_ws:encode_frame({video, <<>>}))].
+```
+
+`truncated_frame_test_/0` cuts a 204-byte frame at every position and expects `more` each time. That is 204 tests, and they cover a TCP read ending anywhere inside the header or the payload.
+
+`chat_http` gets the same treatment.
+
+**Create `test/chat_http_tests.erl`:**
+
+```erlang
+-module(chat_http_tests).
+-include_lib("eunit/include/eunit.hrl").
+
+-define(REQUEST, <<"GET /ws HTTP/1.1\r\nHost: localhost:8080\r\nX-Custom: 1\r\n\r\n">>).
+
+parse_request_test() ->
+    {ok, Request, Rest} = chat_http:parse_request(?REQUEST),
+    ?assertMatch(#{method := 'GET', path := <<"/ws">>}, Request),
+    ?assertEqual(<<>>, Rest).
+
+header_names_are_lowercase_test() ->
+    {ok, #{headers := Headers}, _Rest} = chat_http:parse_request(?REQUEST),
+    ?assertEqual(<<"localhost:8080">>, maps:get(<<"host">>, Headers)),
+    ?assertEqual(<<"1">>, maps:get(<<"x-custom">>, Headers)),
+    ?assertNot(maps:is_key(<<"X-Custom">>, Headers)).
+
+incomplete_request_test() ->
+    ?assertEqual(more, chat_http:parse_request(<<"GET /ws HTTP/1.1\r\nHost: loc">>)).
+
+response_test() ->
+    Response = iolist_to_binary(chat_http:response(404, [], <<"Not here">>)),
+    ?assertEqual(<<"HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\nNot here">>,
+                 Response).
+```
+
+## Fixtures for Stateful Processes
+
+`chat_registry` tests need a running process, and a fresh one each time. If one test registers `<<"alice">>` and the next finds her still there, results depend on test order.
+
+A fixture is a tuple a generator returns. `{setup, Setup, Cleanup, Tests}` runs `Setup` once, then all tests, then `Cleanup`. `{foreach, Setup, Cleanup, Tests}` runs both around every single test. `Cleanup` receives the value `Setup` returned. `rebar3 eunit` does not start our application, so the name `chat_registry` is free.
+
+**Create `test/chat_registry_tests.erl`:**
+
+```erlang
+-module(chat_registry_tests).
+-include_lib("eunit/include/eunit.hrl").
+
+registry_test_() ->
+    {foreach,
+     fun start/0,
+     fun stop/1,
+     [fun register_and_lookup/0,
+      fun name_is_taken/0,
+      fun dead_user_is_removed/0]}.
+
+start() ->
+    {ok, Pid} = chat_registry:start_link(),
+    Pid.
+
+stop(_Pid) ->
+    gen_server:stop(chat_registry).
+
+fake_user() ->
+    spawn(fun() -> receive stop -> ok end end).
+
+register_and_lookup() ->
+    User = fake_user(),
+    ?assertEqual(ok, chat_registry:register_user(<<"alice">>, User)),
+    ?assertEqual({ok, User}, chat_registry:lookup(<<"alice">>)),
+    ?assertEqual({error, not_found}, chat_registry:lookup(<<"bob">>)).
+
+name_is_taken() ->
+    ok = chat_registry:register_user(<<"alice">>, fake_user()),
+    ?assertEqual({error, username_taken},
+                 chat_registry:register_user(<<"alice">>, fake_user())),
+    ?assertEqual([<<"alice">>], chat_registry:list_users()).
+
+dead_user_is_removed() ->
+    User = fake_user(),
+    ok = chat_registry:register_user(<<"alice">>, User),
+    Ref = monitor(process, User),
+    exit(User, kill),
+    receive
+        {'DOWN', Ref, process, User, killed} -> ok
+    after 1000 ->
+        error(user_did_not_die)
+    end,
+    ?assertEqual({error, not_found}, chat_registry:lookup(<<"alice">>)).
+```
+
+The test functions have no `_test` suffix, because the generator lists them. `gen_server:stop/1` is synchronous, so the name is free before the next `start/0` runs.
+
+## Waiting Without Sleeping
+
+`dead_user_is_removed/0` checks the monitor cleanup from lesson 13. `exit(User, kill)` returns at once, and the registry handles its `'DOWN'` message a little later. The tempting fix is `timer:sleep(100)` before the lookup. A sleep is a guess. On a loaded CI machine 100 ms can be too short, and the test fails once a week for no visible reason. Raise it, and the suite gets slow.
+
+The test waits for events instead. It monitors the fake user too and blocks until its own `'DOWN'` arrives. A dying process notifies all of its monitors in one step as it exits, so by then the registry's copy is in its mailbox. This is how the VM behaves on a single node rather than a documented ordering guarantee, so the strict alternative is a helper that retries the lookup a bounded number of times. `lookup/1` is a `gen_server:call`, and the registry handles its mailbox in order. It processes `'DOWN'` first and then answers our call. The `after` clause only exists so a broken test fails instead of hanging.
+
+`--module` runs a single test module. Add `-v` to list every test by name.
+
+```bash
+$ rebar3 eunit --module=chat_registry_tests -v
+module 'chat_registry_tests'
+  chat_registry_tests: register_and_lookup...ok
+  chat_registry_tests: name_is_taken...ok
+  chat_registry_tests: dead_user_is_removed...ok
+  All 3 tests passed.
+```
+
+## Coverage
+
+`rebar3 eunit --cover` records which lines ran, and `rebar3 cover --verbose` prints the summary.
+
+```bash
+$ rebar3 eunit --cover
+225 tests, 0 failures
+$ rebar3 cover --verbose
+  |------------------------|------------|
+  |                module  |  coverage  |
+  |------------------------|------------|
+  |             chat_http  |       44%  |
+  |         chat_registry  |       68%  |
+  |            chat_stats  |        0%  |
+  |               chat_ws  |       56%  |
+  |------------------------|------------|
+  |                 total  |       45%  |
+  |------------------------|------------|
+```
+
+Your table has more rows, one per module in `src/`. `_build/test/cover/index.html` shows each module line by line. `chat_ws` sits at 56% because nothing calls `is_upgrade/1` or `handshake_response/1` yet, and no registry test unregisters a user. Coverage shows what no test touches. It does not show that covered lines are right. `chat_auth` and `chat_room` deserve the same treatment, and the exercises start on that.
+
+## Exercises
+
+**Exercise 1: Test the handshake**
+
+Add tests for `chat_ws:is_upgrade/1` and `chat_ws:handshake_response/1`. Build the request with `chat_http:parse_request/1` instead of writing the map by hand. Then add a registry test for `unregister_user/1`.
+
+```erlang
+% Expected:
+% is_upgrade/1 is true for an upgrade request and false without the Upgrade header
+% handshake_response/1 returns {error, not_websocket} for a plain GET
+% unregister_user/1 frees the name and returns ok for unknown names
+% rebar3 cover --verbose shows higher numbers for chat_ws and chat_registry
+```
+
+**Exercise 2: Test chat_auth**
+
+Write `test/chat_auth_tests.erl` with a `foreach` fixture. Use `?assertMatch` for the random token.
+
+```erlang
+% Expected:
+% register/2 with a taken name  => {error, username_taken}
+% login/2 with a wrong password => {error, invalid_credentials}
+% {ok, Token} = login(...), verify(Token) => {ok, <<"alice">>}
+% verify/1 after logout/1      => {error, invalid_token}
+```
+
+**Exercise 3: A member leaves by dying**
+
+`chat_room` monitors its members. Start `chat_room_sup` and `chat_rooms` in a fixture, join a fake user to a room, kill it, and assert that `chat_room:members/1` is empty. Do not sleep.
+
+```erlang
+% Expected:
+% {ok, _History} = chat_room:join(<<"erlang">>, <<"alice">>, User)
+% after the kill: chat_room:members(<<"erlang">>) => []
+```
+
+## Key Takeaways
+
+- **Supervisors handle faults, tests handle bugs.** A restart cannot fix code that does the wrong thing every time
+- **Tests live in `test/`**, and `rebar3 eunit` runs every function ending in `_test`
+- **A test fails by raising an exception.** Assert macros raise one that carries the expected and the actual value
+- **Generators end in `_test_`** and return tests. A comprehension turns a list of inputs into many tests
+- **`foreach` fixtures** start a fresh process for every test, so test order does not matter
+- **Wait for messages, never sleep.** Monitor the process yourself, then make a synchronous call to the server
+- **Coverage finds untested code.** It says nothing about whether tested code is correct
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l23_failed_match_fails_test",
+      question: "A test fails when it raises an exception. What does this expression evaluate to?",
+      code: "Users = #{<<\"alice\">> => self()}.\ntry\n    {ok, _Pid} = maps:find(<<\"bob\">>, Users),\n    passed\ncatch\n    error:{badmatch, _} -> failed\nend.\n% => ___",
+      answer: "failed",
+      hint: "maps:find/2 returns the atom error for a missing key.",
+      explanation: "The match raises a badmatch error, so passed is never reached. EUnit catches such exceptions and reports the test as failed."
+    },
+    {
+      id: "l23_assert_error_class",
+      question: "?assertError checks for exceptions of one class. Which class does a failed function clause match belong to?",
+      code: "Opcode = fun(text) -> 1; (binary) -> 2 end.\ntry Opcode(video)\ncatch Class:function_clause -> Class\nend.\n% => ___",
+      answer: "error",
+      hint: "The three classes are throw, exit and one more.",
+      explanation: "Runtime failures such as function_clause, badmatch and badarg have class error. ?assertError(function_clause, Expr) passes for exactly this case."
+    },
+    {
+      id: "l23_generator_returns_tests",
+      question: "A generator returns tests without running them. How many tests does this one produce?",
+      code: "round_trip_test_() ->\n    [fun() -> Len = byte_size(binary:copy(<<\"x\">>, Len)) end\n     || Len <- [0, 125, 126, 65535]].\n\nlength(round_trip_test_()).\n% => ___",
+      answer: "4",
+      hint: "The comprehension builds one fun per payload length.",
+      explanation: "The generator returns a list of four funs. EUnit calls each fun later and reports each one as a separate test."
+    },
+    {
+      id: "l23_fixture_kind",
+      question: "Which fixture runs start/0 and stop/1 around every single test in the list?",
+      code: "start() ->\n    {ok, Pid} = chat_registry:start_link(),\n    Pid.\n\nstop(_Pid) ->\n    gen_server:stop(chat_registry).\n\nlookup_unknown() ->\n    {error, not_found} = chat_registry:lookup(<<\"bob\">>).\n\nregistry_test_() ->\n    {___, fun start/0, fun stop/1, [fun lookup_unknown/0]}.",
+      answer: "foreach",
+      hint: "setup would run start/0 only once for the whole list.",
+      explanation: "A foreach fixture gives every test a fresh registry, so tests cannot affect each other."
+    },
+    {
+      id: "l23_setup_value_to_cleanup",
+      question: "This fun imitates what EUnit does with a fixture. What does the cleanup receive?",
+      code: "Setup = fun() -> registry_pid end.\nCleanup = fun(State) -> {stopped, State} end.\nRun = fun(Test) ->\n    State = Setup(),\n    Test(),\n    Cleanup(State)\nend.\nRun(fun() -> ok end).\n% => {stopped, ___}",
+      answer: "registry_pid",
+      hint: "Follow the variable State.",
+      explanation: "EUnit passes the return value of the setup fun to the cleanup fun. That is how stop/1 can get the pid that start/0 created."
+    },
+    {
+      id: "l23_wait_for_down",
+      question: "The test waits for its own 'DOWN' message instead of sleeping. What reason does it receive?",
+      code: "User = spawn(fun() -> receive stop -> ok end end).\nRef = monitor(process, User).\nexit(User, kill).\nreceive\n    {'DOWN', Ref, process, User, Reason} -> Reason\nafter 1000 -> timeout\nend.\n% => ___",
+      answer: "killed",
+      hint: "The exit reason kill is reported under a slightly different name.",
+      explanation: "A process killed with exit(Pid, kill) dies with reason killed. The receive blocks until the message arrives, so no sleep is needed."
+    }
+  ]}
+/>

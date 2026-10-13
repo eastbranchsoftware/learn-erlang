@@ -1,0 +1,435 @@
+---
+title: "Chat Rooms and Channels"
+description: "Give every chat room its own gen_server, start rooms on demand under a supervisor, and keep a short message history per room"
+postNumber: 22
+publishDate: 2026-09-19T00:00:00Z
+tags: ["intermediate", "chat-server", "otp"]
+difficulty: "intermediate"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+Every message still goes to everyone. Real chats have rooms, and nobody knows in advance which rooms users will want. So rooms are created at runtime, like connections. Each room is a process that starts the first time somebody joins it.
+
+## A Process per Room
+
+Lessons 9 and 10 built a `chat_room` by hand. It kept a member list in a `receive` loop, monitored members and sent every message to all of them. The design stays. Now the loop is a gen_server under a supervisor, names and texts are binaries, and the room remembers its last 50 messages for people who join late.
+
+Three modules share the work.
+
+- `chat_room` is one room. It knows its members and its history
+- `chat_room_sup` is a `simple_one_for_one` supervisor, like `chat_conn_sup`
+- `chat_rooms` is the manager. It maps room names to pids and starts missing rooms
+
+**Create `src/chat_room_sup.erl`:**
+
+```erlang
+-module(chat_room_sup).
+-behaviour(supervisor).
+
+-export([start_link/0, start_room/1]).
+-export([init/1]).
+
+start_link() ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
+
+start_room(Name) ->
+    supervisor:start_child(?MODULE, [Name]).
+
+init([]) ->
+    SupFlags = #{strategy => simple_one_for_one},
+    Child = #{
+        id => chat_room,
+        start => {chat_room, start_link, []},
+        restart => temporary
+    },
+    {ok, {SupFlags, [Child]}}.
+```
+
+## The Room Manager
+
+**Create `src/chat_rooms.erl`:**
+
+```erlang
+-module(chat_rooms).
+-behaviour(gen_server).
+
+-export([start_link/0, ensure_room/1, list_rooms/0]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+ensure_room(Name) ->
+    gen_server:call(?MODULE, {ensure_room, Name}).
+
+list_rooms() ->
+    gen_server:call(?MODULE, list_rooms).
+
+%% The state maps a room name to {Pid, MonitorRef}.
+init([]) ->
+    %% Rooms that survived a restart of this process can no longer be found.
+    [supervisor:terminate_child(chat_room_sup, Pid)
+     || {_Id, Pid, _Type, _Modules} <- supervisor:which_children(chat_room_sup)],
+    {ok, #{}}.
+
+handle_call({ensure_room, Name}, _From, Rooms) ->
+    case maps:find(Name, Rooms) of
+        {ok, {Pid, _Ref}} ->
+            {reply, {ok, Pid}, Rooms};
+        error ->
+            {ok, Pid} = chat_room_sup:start_room(Name),
+            Ref = monitor(process, Pid),
+            {reply, {ok, Pid}, Rooms#{Name => {Pid, Ref}}}
+    end;
+handle_call(list_rooms, _From, Rooms) ->
+    {reply, lists:sort(maps:keys(Rooms)), Rooms}.
+
+handle_cast(_Msg, Rooms) ->
+    {noreply, Rooms}.
+
+handle_info({'DOWN', Ref, process, _Pid, _Reason}, Rooms) ->
+    {noreply, maps:filter(fun(_Name, {_P, R}) -> R =/= Ref end, Rooms)};
+handle_info(_Msg, Rooms) ->
+    {noreply, Rooms}.
+```
+
+Picture two users who join the new room `<<"erlang">>` in the same millisecond. If each connection checked for the room and then started it, both would find nothing and we would get two rooms. Here both requests queue in the manager's mailbox. The first one starts the room and stores it. The second finds it in the map. One process serialises creation, as in lesson 13, and no lock is needed.
+
+The manager monitors every room and forgets it when it dies. Rooms are `temporary`, so a dead room is not restarted. The next `ensure_room/1` starts an empty one. `init/1` handles the opposite failure. After a restart of the manager its map is empty, but old rooms may still run under `chat_room_sup`. Nobody could find them, so it stops them.
+
+## The Room
+
+**Create `src/chat_room.erl`:**
+
+```erlang
+-module(chat_room).
+-behaviour(gen_server).
+
+-export([start_link/1, join/3, leave/2, send_message/3, members/1]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+
+-define(HISTORY_SIZE, 50).
+
+start_link(Name) ->
+    gen_server:start_link(?MODULE, Name, []).
+
+join(Room, Username, Pid) ->
+    call(Room, {join, Username, Pid}).
+
+leave(Room, Username) ->
+    call(Room, {leave, Username}).
+
+send_message(Room, From, Text) ->
+    call(Room, {message, From, Text}).
+
+members(Room) ->
+    call(Room, members).
+
+%% Room is the room name. The manager finds or starts the process.
+call(Room, Request) ->
+    {ok, Pid} = chat_rooms:ensure_room(Room),
+    gen_server:call(Pid, Request).
+
+%%% Callbacks
+
+init(Name) ->
+    {ok, #{name => Name, members => #{}, history => []}}.
+
+handle_call({join, Username, Pid}, _From, #{members := Members, history := History} = State) ->
+    case maps:is_key(Username, Members) of
+        true ->
+            {reply, {ok, lists:reverse(History)}, State};
+        false ->
+            Ref = monitor(process, Pid),
+            NewState = State#{members := Members#{Username => {Pid, Ref}}},
+            notify(system_event(Username, <<" joined">>, State), NewState),
+            {reply, {ok, lists:reverse(History)}, NewState}
+    end;
+handle_call({leave, Username}, _From, #{members := Members} = State) ->
+    case maps:take(Username, Members) of
+        {{_Pid, Ref}, Rest} ->
+            demonitor(Ref, [flush]),
+            NewState = State#{members := Rest},
+            notify(system_event(Username, <<" left">>, State), NewState),
+            {reply, ok, NewState};
+        error ->
+            {reply, ok, State}
+    end;
+handle_call({message, Sender, Text}, _From, #{name := Name, members := Members, history := History} = State) ->
+    case maps:is_key(Sender, Members) of
+        true ->
+            Event = #{type => message, room => Name, from => Sender, text => Text},
+            notify(Event, State),
+            {reply, ok, State#{history := lists:sublist([Event | History], ?HISTORY_SIZE)}};
+        false ->
+            {reply, {error, not_member}, State}
+    end;
+handle_call(members, _From, #{members := Members} = State) ->
+    {reply, lists:sort(maps:keys(Members)), State}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info({'DOWN', Ref, process, _Pid, _Reason}, #{members := Members} = State) ->
+    {noreply, State#{members := maps:filter(fun(_Name, {_P, R}) -> R =/= Ref end, Members)}};
+handle_info(_Msg, State) ->
+    {noreply, State}.
+
+%%% Internal
+
+system_event(Username, Suffix, #{name := Name}) ->
+    #{type => system, room => Name, text => <<Username/binary, Suffix/binary>>}.
+
+notify(Event, #{members := Members}) ->
+    maps:foreach(fun(_Name, {Pid, _Ref}) -> Pid ! {chat_event, Event} end, Members).
+```
+
+The API takes the room name, not a pid. `call/2` asks the manager for the pid first, so callers never hold a pid that might be stale.
+
+Members are stored like users in the registry, as `Username => {Pid, Ref}`, and a `'DOWN'` message removes a member whose connection died. The room stays silent about that, because the registry already tells everyone that the user disconnected. `history` holds the newest event first, which makes adding and trimming with `lists:sublist/2` cheap. `join` returns it reversed, oldest first. Every event carries `room`, so a client in several rooms can tell them apart. `send_message/3` is a call and answers `{error, not_member}` to outsiders.
+
+**Update `src/chat_server_sup.erl`:**
+
+```erlang
+%% In src/chat_server_sup.erl, add to the Children list after chat_auth
+        #{id => chat_room_sup, start => {chat_room_sup, start_link, []},
+          type => supervisor, shutdown => infinity},
+        #{id => chat_rooms, start => {chat_rooms, start_link, []}},
+```
+
+The tree is now `chat_stats`, `chat_registry`, `chat_auth`, `chat_room_sup`, `chat_rooms`, `chat_conn_sup`, `chat_listener`. Children start in that order. `chat_rooms:init/1` calls `chat_room_sup`, so the supervisor has to come first. The listener is still last, so no client gets in before the rooms work.
+
+Restart `rebar3 shell`. The shell process can play a member.
+
+```erlang
+1> chat_room:join(<<"erlang">>, <<"alice">>, self()).
+{ok,[]}
+2> chat_room:send_message(<<"erlang">>, <<"alice">>, <<"hello">>).
+ok
+3> flush().
+Shell got {chat_event,#{type => system,text => <<"alice joined">>,
+                        room => <<"erlang">>}}
+Shell got {chat_event,#{type => message,text => <<"hello">>,
+                        from => <<"alice">>,room => <<"erlang">>}}
+ok
+4> chat_room:join(<<"erlang">>, <<"bob">>, self()).
+{ok,[#{type => message,text => <<"hello">>,from => <<"alice">>,
+       room => <<"erlang">>}]}
+5> {ok, Room} = chat_rooms:ensure_room(<<"erlang">>), exit(Room, kill).
+true
+6> chat_rooms:list_rooms().
+[]
+7> chat_room:send_message(<<"erlang">>, <<"alice">>, <<"anyone?">>).
+{error,not_member}
+8> chat_room:members(<<"erlang">>).
+[]
+```
+
+The supervisor report after prompt 5 is left out. A room crash costs something. A fresh room appears on the next use, but members and history are lost, and former members have to join again. That is the price of keeping state in a process. Lesson 28 stores messages in a database.
+
+## Rooms in the Protocol
+
+| Client sends | Server replies |
+| --- | --- |
+| `{"type":"join","room":"erlang"}` | `{"type":"joined","room":"erlang","history":[...]}` |
+| `{"type":"leave","room":"erlang"}` | `{"type":"left","room":"erlang"}` |
+| `{"type":"message","room":"erlang","text":"hi"}` | a `message` event with `room` to all members |
+| `{"type":"rooms"}` | `{"type":"rooms","rooms":["erlang","lobby"]}` |
+
+**Update `src/chat_connection.erl`:**
+
+```erlang
+%% In src/chat_connection.erl
+%% Replace the message clause of handle_message/2 with these clauses.
+handle_message(#{<<"type">> := <<"join">>, <<"room">> := Room},
+               State) when is_binary(Room) ->
+    join_room(Room, State);
+handle_message(#{<<"type">> := <<"leave">>, <<"room">> := Room},
+               #state{username = Name, rooms = Rooms} = State) ->
+    case lists:member(Room, Rooms) of
+        true -> chat_room:leave(Room, Name);
+        false -> ok
+    end,
+    send_event(#{type => left, room => Room}, State),
+    State#state{rooms = lists:delete(Room, Rooms)};
+handle_message(#{<<"type">> := <<"message">>, <<"room">> := Room, <<"text">> := Text},
+               #state{username = Name, rooms = Rooms} = State) when is_binary(Text) ->
+    case lists:member(Room, Rooms) andalso chat_room:send_message(Room, Name, Text) of
+        ok ->
+            chat_stats:increment(messages),
+            State;
+        _NotInRoom ->
+            send_error(not_in_room, State#state{rooms = lists:delete(Room, Rooms)})
+    end;
+handle_message(#{<<"type">> := <<"rooms">>}, State) ->
+    send_event(#{type => rooms, rooms => chat_rooms:list_rooms()}, State),
+    State;
+
+%% In enter_chat/3, replace the two lines after send_event with
+            join_room(<<"lobby">>, State#state{username = Name});
+
+%% Add at the end of the module.
+join_room(Room, #state{username = Name, rooms = Rooms} = State) ->
+    {ok, History} = chat_room:join(Room, Name, self()),
+    send_event(#{type => joined, room => Room, history => History}, State),
+    State#state{rooms = lists:usort([Room | Rooms])}.
+```
+
+After a login everybody lands in `<<"lobby">>`. The `rooms` field of the state finally has a job. The connection refuses a message for a room it never joined without asking anyone. If the room still answers `not_member`, it was restarted, and the connection drops it from the list and reports `not_in_room`. `chat_registry:broadcast/1` stays for server-wide notices such as `alice disconnected`.
+
+## The Client
+
+**Update `priv/index.html`.** Add a second form below the login form.
+
+```html
+    <form id="join">
+      Room <select id="current"></select>
+      <button type="button" id="leave">Leave</button>
+      <input id="room" placeholder="room name">
+      <button>Join</button>
+      <button type="button" id="list">List rooms</button>
+    </form>
+```
+
+Replace the `ws.onmessage` handler with a `handle` function, which can call itself for history entries.
+
+```javascript
+      const forget = (room) =>
+        [...$("current").options].filter((o) => o.value === room).forEach((o) => o.remove());
+
+      function handle(msg) {
+        const tag = msg.room ? `[${msg.room}] ` : "";
+        if (msg.type === "message") show("message", `${tag}${msg.from}: ${msg.text}`);
+        else if (msg.type === "system") show("system", tag + msg.text);
+        else if (msg.type === "rooms") show("system", `rooms: ${msg.rooms.join(", ")}`);
+        else if (msg.type === "left") forget(msg.room);
+        else if (msg.type === "joined") {
+          forget(msg.room);
+          $("current").add(new Option(msg.room, msg.room, true, true));
+          msg.history.forEach(handle);
+        } else if (msg.type === "register_ok") send(credentials("login"));
+        else if (msg.type === "login_ok") {
+          sessionStorage.setItem("token", msg.token);
+          $("login").hidden = true;
+        } else {
+          if (msg.reason === "expired" || msg.reason === "invalid_token") {
+            sessionStorage.removeItem("token");
+          }
+          show("error", `error: ${msg.reason}`);
+        }
+      }
+      ws.onmessage = (event) => handle(JSON.parse(event.data));
+```
+
+Then replace the `$("form").onsubmit` handler with these four.
+
+```javascript
+      $("form").onsubmit = (event) => {
+        event.preventDefault();
+        if ($("text").value) send({type: "message", room: $("current").value, text: $("text").value});
+        $("text").value = "";
+      };
+      $("join").onsubmit = (event) => {
+        event.preventDefault();
+        if ($("room").value) send({type: "join", room: $("room").value});
+        $("room").value = "";
+      };
+      $("leave").onclick = () => send({type: "leave", room: $("current").value});
+      $("list").onclick = () => send({type: "rooms"});
+```
+
+Register `alice` and `bob` in two tabs. Both start in `lobby`. Join `erlang` as Alice and write something. Bob sees nothing until he joins too, and then the history shows what he missed. The select box decides where the next message goes.
+
+## Exercises
+
+**Exercise 1: Who is in the room**
+
+Add `{"type":"members","room":"erlang"}`, answered with `chat_room:members/1`.
+
+```erlang
+% Expected event:
+% #{type => members, room => <<"erlang">>, members => [<<"alice">>, <<"bob">>]}
+```
+
+**Exercise 2: Close empty rooms**
+
+Make a room return `{stop, normal, ...}` when its last member leaves or dies. The manager's monitor removes it. Keep `<<"lobby">>` alive.
+
+```erlang
+% Expected after the last member left:
+% chat_rooms:list_rooms().  => [<<"lobby">>]
+```
+
+**Exercise 3: Rejoin after a crash**
+
+Let `join_room/2` monitor the room pid from `chat_rooms:ensure_room/1`. On `'DOWN'`, join the room again and tell the client with a `system` event.
+
+```erlang
+% Expected: after exit(Room, kill), chat_room:members(<<"erlang">>)
+% lists the connected members again
+```
+
+## Key Takeaways
+
+- **Dynamic things are processes.** A room is a gen_server started on demand under a `simple_one_for_one` supervisor
+- **One process serialises creation.** `ensure_room/1` cannot create a room twice, because the manager handles one request at a time
+- **Address rooms by name.** Resolving the pid on every call avoids stale pids after a room restart
+- **Bounded history.** Prepend, trim with `lists:sublist/2`, and reverse when handing it out
+- **Start order follows dependencies.** `chat_room_sup` before `chat_rooms`, and the listener last
+- **Process state dies with the process.** A killed room loses members and history, so durable data needs a database
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l22_start_room_call",
+      question: "Which supervisor function starts a new room from the child spec template?",
+      code: "start_room(Name) ->\n    supervisor:___(?MODULE, [Name]).",
+      answer: "start_child",
+      hint: "chat_conn_sup uses the same function for connections.",
+      explanation: "With simple_one_for_one, start_child/2 appends [Name] to the start arguments and calls chat_room:start_link(Name)."
+    },
+    {
+      id: "l22_history_limit",
+      question: "The history holds 50 events and a new one is added. How long is it afterwards?",
+      code: "History = lists:seq(1, 50).\nlength(lists:sublist([new_event | History], 50)).\n% => ___",
+      answer: "50",
+      hint: "lists:sublist/2 keeps at most that many elements from the front.",
+      explanation: "The new event is prepended and the oldest one falls off the end, so the history never grows past 50."
+    },
+    {
+      id: "l22_history_order",
+      question: "The room stores the newest event first. Which one does a joining user get first?",
+      code: "History = [third, second, first].\nhd(lists:reverse(History)).\n% => ___",
+      answer: "first",
+      hint: "join replies with the reversed list.",
+      explanation: "Reversing turns newest-first storage into oldest-first delivery, which is the order a client wants to print."
+    },
+    {
+      id: "l22_outsider_rejected",
+      question: "carol is not a member. What error reason does the room reply with?",
+      code: "handle_call({message, Sender, _Text}, _From, Members) ->\n    case maps:is_key(Sender, Members) of\n        true -> {reply, ok, Members};\n        false -> {reply, {error, not_member}, Members}\n    end.\n\nhandle_call({message, <<\"carol\">>, <<\"hi\">>}, from, #{<<\"alice\">> => pid}).\n% => {reply, {error, ___}, #{<<\"alice\">> => pid}}",
+      answer: "not_member",
+      hint: "maps:is_key/2 returns false for carol.",
+      explanation: "The room checks membership itself, so a stale or dishonest caller cannot post into it."
+    },
+    {
+      id: "l22_joined_twice",
+      question: "A user joins the lobby twice. How many rooms does the connection remember?",
+      code: "Rooms = [<<\"erlang\">>, <<\"lobby\">>].\nlength(lists:usort([<<\"lobby\">> | Rooms])).\n% => ___",
+      answer: "2",
+      hint: "usort sorts and removes duplicates.",
+      explanation: "lists:usort/1 keeps the rooms list free of duplicates however often a client sends join."
+    },
+    {
+      id: "l22_ensure_room_once",
+      question: "Two requests for the same room name reach the manager. Do they get the same pid?",
+      code: "init([]) ->\n    {ok, #{}}.\n\nhandle_call({ensure_room, Name}, _From, Rooms) ->\n    case maps:find(Name, Rooms) of\n        {ok, Pid} ->\n            {reply, Pid, Rooms};\n        error ->\n            Pid = spawn(fun() -> receive stop -> ok end end),\n            {reply, Pid, Rooms#{Name => Pid}}\n    end.\n\n{ok, Manager} = gen_server:start_link(?MODULE, [], []).\nFirst = gen_server:call(Manager, {ensure_room, <<\"erlang\">>}).\nSecond = gen_server:call(Manager, {ensure_room, <<\"erlang\">>}).\nFirst =:= Second.\n% => ___",
+      answer: "true",
+      hint: "The first call stores the pid in the map.",
+      explanation: "The manager handles one request at a time. The second request finds the room that the first one created."
+    }
+  ]}
+/>

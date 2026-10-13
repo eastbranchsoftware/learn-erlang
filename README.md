@@ -4,7 +4,7 @@ An interactive tutorial website for learning Erlang by building a WebSocket chat
 
 ## 🎯 What You'll Build
 
-Through 35 progressive lessons, you'll build a complete WebSocket chat server while learning:
+Through 40 progressive lessons, you'll build a complete WebSocket chat server while learning:
 
 - Erlang fundamentals and functional programming
 - OTP (Open Telecom Platform) patterns
@@ -98,6 +98,12 @@ When creating or modifying koans:
    - `value_check`: For numeric or string values
    - `pattern_check`: For pattern matching scenarios
    - Default: Simple string comparison
+
+Run the koan tests with `cd js-erlang-interpreter && npm test`. The `lesson-koans` suite reads every koan straight from the `.mdx` files, so new lessons are covered automatically. Use `LESSONS=12,13 node tests/lesson-koans.test.js` to check specific lessons. If `escript` is on your PATH, koans from lesson 8 on are also checked against a real Erlang VM:
+
+- The koan code with the answer filled in must parse and compile, so end every expression with a full stop and do not add shell prompts.
+- A `% => Term` comment after an expression is an assertion. The expression is evaluated and its result must equal `Term`.
+- Every code block in a lesson that starts with `-module(` must compile on its own.
 
 Example koan structure:
 

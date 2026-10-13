@@ -1,0 +1,325 @@
+---
+title: "Real-Time Message Broadcasting"
+description: "Define a JSON protocol, fan messages out from the registry to every connection process, and build the browser client"
+postNumber: 20
+publishDate: 2026-09-19T00:00:00Z
+tags: ["intermediate", "chat-server", "websocket"]
+difficulty: "intermediate"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+The server from lesson 19 echoes every text frame back to its sender. A chat needs the opposite. A message from Alice has to reach everybody else, which means one connection process must get data to all the others. Processes share nothing, so the only way is to send messages. One incoming frame becomes one Erlang message per online user. That pattern is called fan-out.
+
+## A Wire Protocol in JSON
+
+Browser and server have to agree on what the text frames contain. We'll use JSON objects with a `type` field.
+
+| Direction | Message |
+| --- | --- |
+| client to server | `{"type":"join","username":"alice"}` |
+| client to server | `{"type":"message","text":"hi"}` |
+| server to client | `{"type":"message","from":"alice","text":"hi"}` |
+| server to client | `{"type":"system","text":"alice joined"}` |
+| server to client | `{"type":"error","reason":"username_taken"}` |
+
+Since OTP 27 the standard library has a `json` module, so we still need no dependencies. Try it in `rebar3 shell`.
+
+```erlang
+1> json:decode(<<"{\"type\":\"message\",\"text\":\"hi\"}">>).
+#{<<"text">> => <<"hi">>,<<"type">> => <<"message">>}
+2> Event = #{type => message, from => <<"alice">>, text => <<"hi">>}.
+#{type => message,text => <<"hi">>,from => <<"alice">>}
+3> iolist_to_binary(json:encode(Event)).
+<<"{\"type\":\"message\",\"text\":\"hi\",\"from\":\"alice\"}">>
+4> json:decode(<<"{oops">>).
+** exception error: {invalid_byte,111}
+     in function  json:invalid_byte/2 (json.erl:543)
+        *** invalid byte 16#6F 'o' at byte position 1
+```
+
+`json:decode/1` returns objects as maps with binary keys and strings as binaries. It never creates atoms, which is what we want for input from strangers. Atoms are not garbage collected, so a decoder that made atoms from keys would let a client fill the atom table and crash the VM. `json:encode/1` accepts atoms as keys and values and writes them as strings. It returns iodata, which `chat_ws:encode_frame/1` takes as it is. Invalid input raises an `error` exception.
+
+This gives us a convention. Events we build are maps with atom keys, such as `#{type => system, text => Text}`. Messages we receive have binary keys, and we match them with patterns such as `#{<<"type">> := <<"join">>}`.
+
+## Fan-Out Through the Registry
+
+`chat_registry` from lesson 13 already knows the pid of every online user. Broadcasting is a loop over that map. Each connection process receives `{chat_event, Event}` and writes the event to its own socket.
+
+**Update `src/chat_registry.erl`:**
+
+```erlang
+%% In src/chat_registry.erl
+%% Add a second export line below the first one.
+-export([broadcast/1]).
+
+%% Add to the client API, after list_users/0.
+-spec broadcast(map()) -> ok.
+broadcast(Event) ->
+    gen_server:cast(?MODULE, {broadcast, Event}).
+
+%% Replace handle_cast/2 and the 'DOWN' clause of handle_info/2.
+handle_cast({broadcast, Event}, Users) ->
+    send_all(Users, Event),
+    {noreply, Users};
+handle_cast(_Msg, Users) ->
+    {noreply, Users}.
+
+handle_info({'DOWN', Ref, process, _Pid, _Reason}, Users) ->
+    case [Name || {Name, {_P, R}} <- maps:to_list(Users), R =:= Ref] of
+        [Name] ->
+            Remaining = maps:remove(Name, Users),
+            send_all(Remaining, #{type => system, text => <<Name/binary, " disconnected">>}),
+            {noreply, Remaining};
+        [] ->
+            {noreply, Users}
+    end;
+
+%% Add at the end of the module.
+send_all(Users, Event) ->
+    maps:foreach(fun(_Name, {Pid, _Ref}) -> Pid ! {chat_event, Event} end, Users).
+```
+
+`broadcast/1` is a cast. The sender has nothing to wait for, and `!` never blocks, so the registry gets through thousands of recipients quickly. The slow part, encoding JSON and writing to a socket, happens in the connection processes, in parallel and on all CPU cores. A client on a bad network delays only its own process.
+
+Leaving needs no protocol message. The registry monitors every connection. When a tab closes, the connection process stops, the `'DOWN'` message arrives, and the registry tells the remaining users. This also covers crashed and killed connections, which could never announce their own exit.
+
+## The Connection Speaks JSON
+
+**Update `src/chat_connection.erl`:**
+
+```erlang
+%% In src/chat_connection.erl
+
+%% Add this clause to handle_info/2, above the catch-all clause.
+handle_info({chat_event, Event}, State) ->
+    send_event(Event, State),
+    {noreply, State};
+
+%% In handle_request/2, count the upgrade. The {ok, Response} branch becomes
+        {ok, Response} ->
+            gen_tcp:send(State#state.socket, Response),
+            chat_stats:increment(connections),
+            process(State#state{phase = websocket});
+
+%% Replace the {text, Text} clause of handle_frame/2.
+handle_frame({text, Text}, State) ->
+    NewState =
+        try json:decode(Text) of
+            Message -> handle_message(Message, State)
+        catch
+            error:_ -> send_error(invalid_json, State)
+        end,
+    process(NewState);
+
+%% Add at the end of the module.
+send_event(Event, State) ->
+    send_frame({text, json:encode(Event)}, State).
+
+send_error(Reason, State) ->
+    send_event(#{type => error, reason => Reason}, State),
+    State.
+
+%%% Chat protocol. Every clause returns the new state.
+
+handle_message(#{<<"type">> := <<"join">>, <<"username">> := Name},
+               #state{username = undefined} = State) when is_binary(Name) ->
+    case chat_registry:register_user(Name, self()) of
+        ok ->
+            chat_registry:broadcast(#{type => system, text => <<Name/binary, " joined">>}),
+            State#state{username = Name};
+        {error, username_taken} ->
+            send_error(username_taken, State)
+    end;
+handle_message(#{<<"type">> := <<"message">>, <<"text">> := Text},
+               #state{username = Name} = State) when is_binary(Name), is_binary(Text) ->
+    chat_stats:increment(messages),
+    chat_registry:broadcast(#{type => message, from => Name, text => Text}),
+    State;
+handle_message(_Message, State) ->
+    send_error(bad_message, State).
+```
+
+`try ... of` runs the `of` clauses only when `json:decode/1` succeeds. A crash inside `handle_message/2` is not caught there, so a bug of ours is not reported as bad JSON.
+
+Each protocol message is one `handle_message/2` clause, and the function head does the validation. `join` only matches while `username` is `undefined`. `message` only matches when `username` is a binary, so nobody can talk before joining. The guards reject a `text` that is a number or a list. Everything else lands in the last clause and gets an error event. The connection stays open, because a confused client is not a reason to disconnect. A new message type is a new clause above the catch-all.
+
+`register_user/2` is a call and `broadcast/1` a cast, both from the same process to the registry. Messages between two processes arrive in the order they were sent. The new user is in the map before the broadcast is handled, so everyone sees their own join notice.
+
+The sender's own messages take the same route. The connection does not echo them locally. It receives them as `{chat_event, ...}` like everyone else, so all clients see the same order.
+
+## The Browser Client
+
+**Update `priv/index.html`** with the real client.
+
+```html
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Erlang Chat</title>
+    <style>
+      body { font-family: sans-serif; max-width: 40em; margin: 2em auto; }
+      #log { height: 20em; overflow-y: auto; border: 1px solid #ccc; padding: 0.5em; }
+      .system { color: #888; }
+      .error { color: #c00; }
+    </style>
+  </head>
+  <body>
+    <h1>Erlang Chat</h1>
+    <div id="log"></div>
+    <form id="form"><input id="text" autocomplete="off"> <button>Send</button></form>
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const ws = new WebSocket(`ws://${location.host}/ws`);
+      const send = (msg) => ws.send(JSON.stringify(msg));
+
+      function show(kind, text) {
+        const line = document.createElement("div");
+        line.className = kind;
+        line.textContent = text;
+        $("log").append(line);
+        $("log").scrollTop = $("log").scrollHeight;
+      }
+
+      ws.onopen = () => send({type: "join", username: prompt("Username?")});
+      ws.onclose = () => show("system", "connection closed");
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "message") show("message", `${msg.from}: ${msg.text}`);
+        else if (msg.type === "system") show("system", msg.text);
+        else show("error", `error: ${msg.reason}`);
+      };
+
+      $("form").onsubmit = (event) => {
+        event.preventDefault();
+        if ($("text").value) send({type: "message", text: $("text").value});
+        $("text").value = "";
+      };
+    </script>
+  </body>
+</html>
+```
+
+`textContent` inserts text as text. A message such as `<script>alert(1)</script>` shows up literally and never runs. Building the line with `innerHTML` would let any user run code in everyone else's browser.
+
+## Two Tabs
+
+Restart `rebar3 shell` and open `http://localhost:8080/` in two tabs. Join as `alice` in one and `bob` in the other. Both tabs show `bob joined`, and every message appears in both. Send one message from each. The shell sees the same picture, and it can take part.
+
+```erlang
+1> chat_registry:list_users().
+[<<"alice">>,<<"bob">>]
+2> chat_stats:get_all().
+#{messages => 2,connections => 2}
+3> chat_registry:broadcast(#{type => system, text => <<"server restarts at noon">>}).
+ok
+```
+
+Pick `alice` again in a third tab and it shows `error: username_taken`. Reload the page to try another name. Close Bob's tab and Alice sees `bob disconnected`. The same happens after `exit(Pid, kill)` with the pid from `chat_registry:lookup(<<"bob">>)`, and the others keep chatting.
+
+## Exercises
+
+**Exercise 1: Who is online**
+
+Add a `who` message. The server answers the asking client only.
+
+```json
+{"type":"who"}
+```
+
+```erlang
+% Expected reply event:
+% #{type => users, users => [<<"alice">>, <<"bob">>]}
+```
+
+**Exercise 2: Private messages**
+
+Add `{"type":"private","to":"bob","text":"psst"}`. Use `chat_registry:lookup/1` and send the `{chat_event, ...}` message to that pid and to the sender. Reply with the error reason `unknown_user` when the lookup fails.
+
+```erlang
+% Expected event for both parties:
+% #{type => private, from => <<"alice">>, to => <<"bob">>, text => <<"psst">>}
+```
+
+**Exercise 3: Length limit**
+
+Reject messages whose `text` is empty or longer than 1000 bytes with the reason `bad_length`. A guard with `byte_size/1` is enough.
+
+```erlang
+% Expected for a 2000 byte text:
+% #{type => error, reason => bad_length}
+```
+
+## Key Takeaways
+
+- **Fan-out is message passing.** One incoming frame becomes one `{chat_event, Event}` message per online user
+- **The registry sends, the connections write.** `!` is cheap, and the slow socket work is spread over all connection processes
+- **`json:decode/1`** returns maps with binary keys and raises an error for invalid input. It never creates atoms from client data
+- **`json:encode/1`** accepts atom keys and atom values and returns iodata
+- **One clause per message type.** Patterns and guards validate the input, and a catch-all clause answers with an error event
+- **Monitors detect leaving.** The `'DOWN'` handler announces a disconnect even when the connection process was killed
+- **Escape on output.** `textContent` keeps chat text from running as HTML in other browsers
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l20_decode_binary_keys",
+      question: "What does the decoded map hold under the key <<\"type\">>?",
+      code: 'Message = json:decode(<<"{\\"type\\":\\"join\\",\\"username\\":\\"alice\\"}">>).\nmaps:get(<<"type">>, Message).\n% => ___',
+      answer: '<<"join">>',
+      hint: "JSON strings become binaries, both as keys and as values.",
+      explanation: "json:decode/1 never creates atoms. Keys and string values are binaries."
+    },
+    {
+      id: "l20_encode_returns_iodata",
+      question: "Is the result of json:encode/1 a binary?",
+      code: "is_binary(json:encode(#{type => system})).\n% => ___",
+      answer: "false",
+      hint: "gen_tcp:send/2 and encode_frame/1 accept it as it is.",
+      explanation: "json:encode/1 returns iodata, a nested list of binaries and bytes. Use iolist_to_binary/1 only when you need to look at it."
+    },
+    {
+      id: "l20_atoms_become_strings",
+      question: "An event with atoms is encoded and decoded again. What is the value now?",
+      code: "Json = iolist_to_binary(json:encode(#{type => system})).\njson:decode(Json).\n% => #{<<\"type\">> => ___}",
+      answer: '<<"system">>',
+      hint: "JSON has no atoms. They are written as strings.",
+      explanation: "Atom keys and values are encoded as JSON strings, and decoding always gives binaries."
+    },
+    {
+      id: "l20_invalid_json_caught",
+      question: "What does this expression return for broken input?",
+      code: 'try json:decode(<<"{oops">>) of\n    _Message -> decoded\ncatch\n    error:_ -> invalid_json\nend.\n% => ___',
+      answer: "invalid_json",
+      hint: "json:decode/1 raises an error exception for invalid input.",
+      explanation: "The of clause runs only when decoding succeeds. The exception is caught and turned into a reason the client can be told."
+    },
+    {
+      id: "l20_event_tag",
+      question: "Which tag must the broadcast use so that both receives match?",
+      code: "Users = #{<<\"alice\">> => {self(), ref1}, <<\"bob\">> => {self(), ref2}}.\nEvent = #{type => system, text => <<\"hi\">>}.\nmaps:foreach(fun(_Name, {Pid, _Ref}) -> Pid ! {___, Event} end, Users).\n[receive {chat_event, #{text := Text}} -> Text after 1000 -> timeout end || _ <- [1, 2]].\n% => [<<\"hi\">>, <<\"hi\">>]",
+      answer: "chat_event",
+      hint: "chat_connection matches the same tuple in handle_info/2.",
+      explanation: "Both map entries point at this process, so it receives the event twice. In the server each pid is a different connection."
+    },
+    {
+      id: "l20_event_callback",
+      question: "Which gen_server callback receives a message that was sent with the ! operator?",
+      code: "___({chat_event, Event}, State) ->\n    send_event(Event, State),\n    {noreply, State}.\n\nsend_event(Event, Socket) ->\n    gen_tcp:send(Socket, chat_ws:encode_frame({text, json:encode(Event)})).",
+      answer: "handle_info",
+      hint: "It is neither a call nor a cast.",
+      explanation: "Plain messages, like socket data and monitor notifications, arrive in handle_info/2."
+    },
+    {
+      id: "l20_message_before_join",
+      question: "What reason does a client get when it sends a message before joining?",
+      code: "handle_message(#{<<\"type\">> := <<\"message\">>, <<\"text\">> := Text}, Name) when is_binary(Name) ->\n    {broadcast, Name, Text};\nhandle_message(_Message, _Name) ->\n    {error, bad_message}.\n\nhandle_message(#{<<\"type\">> => <<\"message\">>, <<\"text\">> => <<\"hi\">>}, undefined).\n% => {error, ___}",
+      answer: "bad_message",
+      hint: "undefined is an atom, so the guard of the first clause fails.",
+      explanation: "The function head validates the input. Anything that matches no specific clause falls through to the catch-all."
+    }
+  ]}
+/>

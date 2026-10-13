@@ -1,0 +1,360 @@
+---
+title: "User Authentication and Sessions"
+description: "Store salted password hashes, issue random session tokens with an expiry, and let only authenticated connections chat"
+postNumber: 21
+publishDate: 2026-09-19T00:00:00Z
+tags: ["intermediate", "chat-server", "security"]
+difficulty: "intermediate"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+In lesson 20 anybody can type `alice` into the prompt and be Alice. A chat needs accounts. Users register once with a password, log in to prove who they are, and get a session token so that a page reload does not ask for the password again. One new gen_server, `chat_auth`, owns all of that.
+
+## Storing Passwords
+
+The server must check a password without knowing it. If the user table leaks, it should not hand every password to the thief. So we store a hash, and three details decide what that hash is worth.
+
+**Slow on purpose.** SHA-256 is built for speed, and a graphics card tries billions of guesses per second against it. PBKDF2 runs the hash in a chain. With 100000 iterations, every guess costs the attacker 100000 times more. A user who logs in once hardly notices.
+
+**A salt per user.** The salt is 16 random bytes that go into the hash and are stored next to it. Two users with the same password get different hashes, and a precomputed table of common password hashes is useless.
+
+**Constant-time comparison.** `=:=` stops at the first byte that differs, so the time it takes leaks how much of a guess was right. `crypto:hash_equals/2` always compares every byte.
+
+## Session Tokens
+
+After a login the server creates a token with `crypto:strong_rand_bytes(32)`, the generator meant for secrets. 256 random bits cannot be guessed, and the token says nothing about the user or the password. The server remembers which user a token belongs to and when it expires. Expiry is a plain integer comparison with `erlang:system_time(second)`. A stolen token stops working after a day. `logout/1` removes it at once, and `verify/1` then answers `invalid_token`.
+
+## The chat_auth Module
+
+**Create `src/chat_auth.erl`:**
+
+```erlang
+-module(chat_auth).
+-behaviour(gen_server).
+
+-export([start_link/0, register/2, login/2, verify/1, logout/1]).
+-export([init/1, handle_call/3, handle_cast/2]).
+
+-define(ITERATIONS, 100000).
+-define(SESSION_SECONDS, 86400).
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+-spec register(binary(), binary()) ->
+    ok | {error, username_taken | invalid_username | weak_password}.
+register(Username, Password) ->
+    gen_server:call(?MODULE, {register, Username, Password}).
+
+-spec login(binary(), binary()) -> {ok, binary()} | {error, invalid_credentials}.
+login(Username, Password) ->
+    gen_server:call(?MODULE, {login, Username, Password}).
+
+-spec verify(binary()) -> {ok, binary()} | {error, invalid_token | expired}.
+verify(Token) ->
+    gen_server:call(?MODULE, {verify, Token}).
+
+-spec logout(binary()) -> ok.
+logout(Token) ->
+    gen_server:call(?MODULE, {logout, Token}).
+
+%%% Callbacks
+
+init([]) ->
+    {ok, #{users => #{}, sessions => #{}}}.
+
+handle_call({register, Username, Password}, _From, #{users := Users} = State) ->
+    case {valid_username(Username), byte_size(Password) >= 8, maps:is_key(Username, Users)} of
+        {false, _, _} ->
+            {reply, {error, invalid_username}, State};
+        {true, false, _} ->
+            {reply, {error, weak_password}, State};
+        {true, true, true} ->
+            {reply, {error, username_taken}, State};
+        {true, true, false} ->
+            Salt = crypto:strong_rand_bytes(16),
+            User = {Salt, hash(Password, Salt)},
+            {reply, ok, State#{users := Users#{Username => User}}}
+    end;
+handle_call({login, Username, Password}, _From, #{users := Users, sessions := Sessions} = State) ->
+    case maps:find(Username, Users) of
+        {ok, {Salt, Hash}} ->
+            case crypto:hash_equals(Hash, hash(Password, Salt)) of
+                true ->
+                    Token = binary:encode_hex(crypto:strong_rand_bytes(32)),
+                    Expires = erlang:system_time(second) + ?SESSION_SECONDS,
+                    {reply, {ok, Token}, State#{sessions := Sessions#{Token => {Username, Expires}}}};
+                false ->
+                    {reply, {error, invalid_credentials}, State}
+            end;
+        error ->
+            {reply, {error, invalid_credentials}, State}
+    end;
+handle_call({verify, Token}, _From, #{sessions := Sessions} = State) ->
+    Now = erlang:system_time(second),
+    case maps:find(Token, Sessions) of
+        {ok, {Username, Expires}} when Expires > Now ->
+            {reply, {ok, Username}, State};
+        {ok, _Expired} ->
+            {reply, {error, expired}, State#{sessions := maps:remove(Token, Sessions)}};
+        error ->
+            {reply, {error, invalid_token}, State}
+    end;
+handle_call({logout, Token}, _From, #{sessions := Sessions} = State) ->
+    {reply, ok, State#{sessions := maps:remove(Token, Sessions)}}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+%%% Internal
+
+hash(Password, Salt) ->
+    crypto:pbkdf2_hmac(sha256, Password, Salt, ?ITERATIONS, 32).
+
+valid_username(Name) ->
+    byte_size(Name) >= 3 andalso byte_size(Name) =< 20
+        andalso lists:all(fun valid_char/1, binary_to_list(Name)).
+
+valid_char(C) ->
+    (C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) orelse C =:= $_.
+```
+
+The state holds two maps. `users` maps a username to `{Salt, Hash}`, and `sessions` maps a token to `{Username, Expires}`. Both live in process memory, so accounts vanish when the server restarts. Lesson 28 moves them into a database.
+
+Usernames are 3 to 20 characters from `a-z`, `0-9` and `_`. A strict rule now avoids trouble later with names such as `Alice` and `alice`, or names made of spaces. Register checks run inside one `handle_call/3`, so two people cannot grab the same name at the same time. Login gives the same `invalid_credentials` for an unknown user and a wrong password. A different answer would tell an attacker which names exist. `verify/1` deletes an expired token when it meets one, so the second attempt reports `invalid_token`.
+
+Our `register/2` does not clash with the `register/2` BIF, because we always call it as `chat_auth:register`.
+
+**Update `src/chat_server_sup.erl`:**
+
+```erlang
+%% In src/chat_server_sup.erl, add to the Children list after chat_registry
+        #{id => chat_auth, start => {chat_auth, start_link, []}},
+```
+
+Restart `rebar3 shell`.
+
+```erlang
+1> chat_auth:register(<<"Al">>, <<"correct horse">>).
+{error,invalid_username}
+2> chat_auth:register(<<"alice">>, <<"horse">>).
+{error,weak_password}
+3> chat_auth:register(<<"alice">>, <<"correct horse">>).
+ok
+4> chat_auth:register(<<"alice">>, <<"another password">>).
+{error,username_taken}
+5> chat_auth:login(<<"alice">>, <<"wrong horse">>).
+{error,invalid_credentials}
+6> {ok, Token} = chat_auth:login(<<"alice">>, <<"correct horse">>).
+{ok,<<"0BC202F080E238C633E466028D42C39AF057E6C3005B5A76EBB201BD71211AD7">>}
+7> chat_auth:verify(Token).
+{ok,<<"alice">>}
+8> chat_auth:verify(<<"made up">>).
+{error,invalid_token}
+```
+
+## The Cost of a Slow Hash
+
+The hash runs inside the `chat_auth` process. Measure a login.
+
+```erlang
+9> {Micros, _} = timer:tc(fun() -> chat_auth:login(<<"alice">>, <<"correct horse">>) end), Micros.
+11570
+```
+
+About 12 milliseconds on this machine. A gen_server handles one message at a time, so `chat_auth` manages roughly 85 logins per second, and every `verify/1` waits in the same queue. When 20 processes logged in at once here, the slowest waited 238 ms. That is fine for a small chat. A big one should move the hashing out of the server. Exercise 2 computes the hash in the caller's process, so logins run in parallel on all cores and the server only reads and writes its maps.
+
+## Protocol Changes
+
+| Client sends | Server replies |
+| --- | --- |
+| `{"type":"register","username":"alice","password":"..."}` | `{"type":"register_ok","username":"alice"}` |
+| `{"type":"login","username":"alice","password":"..."}` | `{"type":"login_ok","username":"alice","token":"..."}` |
+| `{"type":"auth","token":"..."}` | the same `login_ok` |
+
+Failures arrive as `error` events whose reason is the atom from `chat_auth`, for example `invalid_credentials` or `expired`. The old `join` message is gone. A connection enters the registry only after `login` or `auth` succeeded.
+
+**Update `src/chat_connection.erl`:**
+
+```erlang
+%% In src/chat_connection.erl
+%% Replace the join clause of handle_message/2 with these clauses.
+handle_message(#{<<"type">> := <<"register">>, <<"username">> := Name, <<"password">> := Password},
+               State) when is_binary(Name), is_binary(Password) ->
+    case chat_auth:register(Name, Password) of
+        ok ->
+            send_event(#{type => register_ok, username => Name}, State),
+            State;
+        {error, Reason} ->
+            send_error(Reason, State)
+    end;
+handle_message(#{<<"type">> := <<"login">>, <<"username">> := Name, <<"password">> := Password},
+               #state{username = undefined} = State) when is_binary(Name), is_binary(Password) ->
+    case chat_auth:login(Name, Password) of
+        {ok, Token} -> enter_chat(Name, Token, State);
+        {error, Reason} -> send_error(Reason, State)
+    end;
+handle_message(#{<<"type">> := <<"auth">>, <<"token">> := Token},
+               #state{username = undefined} = State) when is_binary(Token) ->
+    case chat_auth:verify(Token) of
+        {ok, Name} -> enter_chat(Name, Token, State);
+        {error, Reason} -> send_error(Reason, State)
+    end;
+handle_message(_Message, #state{username = undefined} = State) ->
+    send_error(not_authenticated, State);
+
+%% Add at the end of the module.
+enter_chat(Name, Token, State) ->
+    case chat_registry:register_user(Name, self()) of
+        ok ->
+            send_event(#{type => login_ok, username => Name, token => Token}, State),
+            chat_registry:broadcast(#{type => system, text => <<Name/binary, " joined">>}),
+            State#state{username = Name};
+        {error, username_taken} ->
+            send_error(already_online, State)
+    end.
+```
+
+The fourth clause is the gate. Whatever an unauthenticated connection sends, other than the three messages above it, gets `not_authenticated`. The `message` clause below it is unchanged. `already_online` is the answer when the same account is logged in from another tab.
+
+## The Client
+
+**Update `priv/index.html`.** Add the login form below the `h1` line.
+
+```html
+    <form id="login">
+      <input id="username" placeholder="username">
+      <input id="password" type="password" placeholder="password">
+      <button>Log in</button>
+      <button type="button" id="register">Register</button>
+    </form>
+```
+
+In the script, replace the `ws.onopen` line with the first part. Replace the `ws.onmessage` handler with the second part, which also brings two new form handlers.
+
+```javascript
+      const credentials = (type) =>
+        ({type, username: $("username").value, password: $("password").value});
+
+      ws.onopen = () => {
+        const token = sessionStorage.getItem("token");
+        if (token) send({type: "auth", token});
+      };
+
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "message") show("message", `${msg.from}: ${msg.text}`);
+        else if (msg.type === "system") show("system", msg.text);
+        else if (msg.type === "register_ok") send(credentials("login"));
+        else if (msg.type === "login_ok") {
+          sessionStorage.setItem("token", msg.token);
+          $("login").hidden = true;
+        } else {
+          if (msg.reason === "expired" || msg.reason === "invalid_token") {
+            sessionStorage.removeItem("token");
+          }
+          show("error", `error: ${msg.reason}`);
+        }
+      };
+
+      $("login").onsubmit = (event) => {
+        event.preventDefault();
+        send(credentials("login"));
+      };
+      $("register").onclick = () => send(credentials("register"));
+```
+
+After `register_ok` the client logs in with the same form values. The token goes into `sessionStorage`, which belongs to one tab. After a reload the client sends `auth` instead of asking for the password.
+
+One warning. Passwords and tokens cross the network as readable text inside `ws://` frames, and anyone on the path can copy them. The fix is TLS, which lesson 34 adds.
+
+## Exercises
+
+**Exercise 1: Logout**
+
+Add a `logout` message. Keep the token in `#state{}`, call `chat_auth:logout/1`, reply with `logout_ok` and stop the connection.
+
+```json
+{"type":"logout"}
+```
+
+**Exercise 2: Hash in the caller**
+
+Move the PBKDF2 work out of the server process. For `register/2`, create salt and hash in the client function and send both to the server. For `login/2`, first fetch the salt with a new call, hash in the caller, then send the hash for comparison. Repeat the measurement with 20 parallel logins.
+
+```erlang
+% Expected: the slowest of 20 parallel logins takes far less than 238 ms
+```
+
+**Exercise 3: Sweep expired sessions**
+
+Expired tokens are removed only when somebody verifies them. Call `erlang:send_after(60000, self(), sweep)` in `init/1`, and add a `handle_info/2` clause that drops expired sessions and schedules the next sweep.
+
+```erlang
+% Expected: sys:get_state(chat_auth) shows fewer sessions after a sweep
+```
+
+## Key Takeaways
+
+- **Never store passwords.** Store a random salt per user and a slow hash such as `crypto:pbkdf2_hmac/5` with many iterations
+- **`crypto:hash_equals/2`** compares in constant time. `=:=` leaks how many bytes matched
+- **Tokens are random bytes** from `crypto:strong_rand_bytes/1` with an expiry checked against `erlang:system_time(second)`
+- **One error for all login failures.** `invalid_credentials` does not reveal which usernames exist
+- **Slow work inside a gen_server blocks its queue.** Measure with `timer:tc/1`, and move heavy work into the callers when it hurts
+- **Authenticate before registering.** A connection joins `chat_registry` only after `login` or `auth` succeeded
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l21_salt_changes_hash",
+      question: "Two users pick the same password but have different salts. Are their hashes equal?",
+      code: 'Hash = fun(Salt) -> crypto:pbkdf2_hmac(sha256, <<"correct horse">>, Salt, 1000, 32) end.\nHash(<<"salt of alice">>) =:= Hash(<<"salt of bob">>).\n% => ___',
+      answer: "false",
+      hint: "The salt is part of the input.",
+      explanation: "A different salt gives a different hash, so nobody can see that two users share a password."
+    },
+    {
+      id: "l21_token_size",
+      question: "How many characters does a session token have?",
+      code: "Token = binary:encode_hex(crypto:strong_rand_bytes(32)).\nbyte_size(Token).\n% => ___",
+      answer: "64",
+      hint: "Hex encoding writes two characters per byte.",
+      explanation: "32 random bytes become 64 hex characters, which travel safely inside JSON."
+    },
+    {
+      id: "l21_constant_time_compare",
+      question: "Which crypto function compares two hashes in constant time?",
+      code: "check(Password, Salt, StoredHash) ->\n    Hash = crypto:pbkdf2_hmac(sha256, Password, Salt, 100000, 32),\n    crypto:___(StoredHash, Hash).",
+      answer: "hash_equals",
+      hint: "It takes two binaries of equal size and returns a boolean.",
+      explanation: "hash_equals/2 looks at every byte, so its running time tells an attacker nothing."
+    },
+    {
+      id: "l21_expired_session",
+      question: "What does the check return for a session that expired at second 1000 when the clock says 2000?",
+      code: "check({Username, Expires}, Now) when Expires > Now ->\n    {ok, Username};\ncheck({_Username, _Expires}, _Now) ->\n    {error, expired}.\n\ncheck({<<\"alice\">>, 1000}, 2000).\n% => {error, ___}",
+      answer: "expired",
+      hint: "The guard Expires > Now fails.",
+      explanation: "Expiry is an integer comparison. chat_auth gets the current time from erlang:system_time(second)."
+    },
+    {
+      id: "l21_username_rule",
+      question: "Does the name <<\"Alice\">> pass the character check?",
+      code: "valid_char(C) ->\n    (C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) orelse C =:= $_.\n\nlists:all(fun valid_char/1, binary_to_list(<<\"Alice\">>)).\n% => ___",
+      answer: "false",
+      hint: "Look at the first character.",
+      explanation: "Only lowercase letters, digits and underscores are allowed, so the uppercase A fails."
+    },
+    {
+      id: "l21_unauthenticated_gate",
+      question: "Which username value marks a connection that has not logged in?",
+      code: "-record(state, {socket, username}).\n\nhandle_message(_Message, #state{username = ___}) ->\n    {error, not_authenticated};\nhandle_message(Message, #state{username = Name}) ->\n    {ok, Name, Message}.\n\nnew_connection() ->\n    #state{}.\n\nhandle_message(hello, new_connection()).\n% => {error, not_authenticated}",
+      answer: "undefined",
+      hint: "It is the default value of a record field.",
+      explanation: "The username field is undefined until enter_chat/3 sets it, so one clause can reject everything from strangers."
+    }
+  ]}
+/>

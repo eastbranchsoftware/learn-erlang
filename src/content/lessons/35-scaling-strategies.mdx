@@ -1,0 +1,263 @@
+---
+title: "Scaling Strategies"
+description: "Measure the limits of one chat node, raise the ones that bind, then spread connections over more nodes"
+postNumber: 35
+publishDate: 2026-09-19T00:00:00Z
+tags: ["advanced", "scaling", "performance"]
+difficulty: "advanced"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+Lesson 34 limited what one client can do to the server. This lesson asks what the whole server can do. Every number below comes from one laptop, so yours will differ. The method carries over.
+
+## Descriptors Run Out First
+
+A connection is a socket, and a socket is a file descriptor. Two limits apply. The operating system caps descriptors per process, reported by `ulimit -n`. The VM caps ports, which `erlang:system_info(port_limit)` reports and the `+Q` flag raises.
+
+```bash
+$ ulimit -n
+1048576
+$ P='io:format("~p~n", [erlang:system_info(port_limit)]), halt().'
+$ erl -noshell -eval "$P"
+1048576
+$ (ulimit -n 1024; erl -noshell -eval "$P")
+65536
+$ erl -noshell +Q 200000 -eval "$P"
+262144
+```
+
+The VM takes its default from `ulimit -n`, never below 65,536, and rounds any request up to a power of two. `+Q` reserves table slots inside the VM. It does not create descriptors. The lower limit is the one you hit, and the OS limit hurts most, because it surfaces in `accept`.
+
+**Create `scale_probe.erl`** outside the project.
+
+```erlang
+-module(scale_probe).
+-export([descriptors/0]).
+
+%% Open client sockets until the VM runs out of file descriptors.
+descriptors() ->
+    {ok, Listen} = gen_tcp:listen(9100, [{active, false}, {backlog, 1024}]),
+    {Sockets, Reason} = burn([]),
+    Report = {Reason, length(Sockets), erlang:system_info(port_limit),
+              gen_tcp:accept(Listen, 1000)},
+    %% Free descriptors first, or io:format cannot open its own port.
+    [gen_tcp:close(S) || S <- [Listen | Sockets]],
+    io:format("~p~n", [Report]).
+
+burn(Acc) ->
+    case gen_tcp:connect("localhost", 9100, [{active, false}], 1000) of
+        {ok, Socket} -> burn([Socket | Acc]);
+        {error, Reason} -> {Acc, Reason}
+    end.
+```
+
+```bash
+$ (ulimit -n 160; erl -noshell -pa . -eval 'scale_probe:descriptors(), halt().')
+{emfile,122,65536,{error,emfile}}
+```
+
+122 sockets, while the VM still believed it had 65,536 ports free. The lesson 34 acceptor would crash on that `{error, emfile}`, take the listener down through its link, and restart into the same wall. Handle it and wait instead. Since lesson 34 every socket call goes through `chat_transport`, so the fragments below use it.
+
+```erlang
+%% In src/chat_listener.erl
+accept_loop(ListenSocket) ->
+    case chat_transport:accept(ListenSocket) of
+        {ok, Socket} ->
+            {ok, Pid} = chat_conn_sup:start_connection(Socket),
+            ok = chat_transport:controlling_process(Socket, Pid),
+            chat_connection:socket_ready(Pid);
+        {error, emfile} ->
+            %% Out of descriptors. Wait for some to be freed.
+            receive after 200 -> ok end
+    end,
+    accept_loop(ListenSocket).
+```
+
+Raise the real limit with `LimitNOFILE` in the systemd unit from lesson 25. Processes are not the wall. `config/vm.args` already carries `+P 2000000`, so `erlang:system_info(process_limit)` reports 2,097,152. A connection costs one process, and processes are cheap.
+
+## Memory Per Connection
+
+Measure it. Garbage collect every process on the server, read `erlang:memory(total)`, open N idle connections from a second node, let them settle, read again, divide by N. These are the numbers for 2,000 connections.
+
+| Setting | Bytes per idle connection |
+| --- | --- |
+| Default | 13,013 |
+| `hibernate_after` turned off | 71,426 |
+| Default plus `{buffer, 1460}` | 5,234 |
+
+Only 1,790 of the default 13,013 is the process, close to the 1,656 bytes lesson 27 measured after `hibernate_after` shrank the heap. The rest is the socket. `inet:getopts/2` reports `buffer` at 9,216 bytes here, the driver's read buffer, one per socket. Cutting it to one ethernet payload costs an extra read on large frames and saves 7.8 KB per connection.
+
+Without `hibernate_after` a connection holds 71 KB, because the process never collects and the binaries it touched stay alive. At 13 KB, 100,000 connections need 1.3 GB.
+
+## Accepting Fast Enough
+
+`chat_listener` starts a pool of acceptors instead of one. They all block in `chat_transport:accept/1` on the same listen socket, and the kernel gives each connection to exactly one of them.
+
+```erlang
+%% In src/chat_listener.erl
+init(Port) ->
+    {ok, ListenSocket} = chat_transport:listen(Port),
+    Count = application:get_env(chat_server, acceptors, 10),
+    [spawn_link(fun() -> accept_loop(ListenSocket) end) || _ <- lists:seq(1, Count)],
+    {ok, ListenSocket}.
+```
+
+Add `{acceptors, 10}` next to `{port, 8080}` in the app env. They are all `spawn_link`ed, so listener and pool share their fate, as in lesson 19.
+
+Connections arriving while no acceptor is ready wait in the kernel's accept queue. Its size is the `backlog` listen option, and the default of 5 is far too small. Add `{backlog, 1024}` to `?OPTIONS` in `chat_transport`.
+
+Opening 1,000 connections at once, all arrived in 151 to 430 ms, and the gap between one acceptor and ten was smaller than between two runs of the same setting. With `{backlog, 4}` the burst fell apart.
+
+```text
+backlog 1024:  ok 1000 failed 0 in 151 ms; connect p50 81813 us p99 148998 us
+backlog 4:     ok 497 failed 503 in 7821 ms; errors: [{error,etimedout}]
+```
+
+The backlog survives a connection storm. The pool is insurance for when the work between two accepts stops being free, as TLS made it in lesson 34.
+
+## Slow Clients
+
+`gen_tcp:send/2` returns when the kernel has the bytes, not when the client has them. A client that stops reading closes its receive window, the kernel buffer fills, and the call blocks. Push 64 KB at a time into a socket nobody reads.
+
+```erlang
+3> {ok, S} = gen_tcp:accept(L).
+4> Push = fun P(N) -> case gen_tcp:send(S, binary:copy(<<"x">>, 65536)) of
+4>     ok -> P(N + 1); {error, R} -> {N * 64, R} end end.
+5> timer:tc(fun() -> Push(0) end).
+{5005318,{576,timeout}}
+```
+
+576 KB went out, then the call sat for five seconds. Without `{send_timeout, 5000}` it would sit forever, and the connection process with it. `{send_timeout_close, true}` closes the stalled socket, so the process gets `tcp_closed` instead of a broken stream.
+
+Five seconds is a long time in a busy room. A loop behind such a socket held 167 of 200 queued 64 KB events, about 11 MB, in one mailbox. Memory follows the mailbox, so a connection too far behind is dropped, not carried.
+
+```erlang
+%% In src/chat_connection.erl
+handle_info({chat_event, Event}, State) ->
+    {message_queue_len, Queued} = process_info(self(), message_queue_len),
+    case Queued < 1000 andalso send_event(Event, State) of
+        ok -> {noreply, State};
+        false -> {stop, normal, State};
+        {error, _Reason} -> {stop, normal, State}
+    end;
+```
+
+Lesson 32's client reconnects with backoff, so a dropped reader comes back.
+
+## Finding the Limit
+
+`src/chat_load.erl` is a load generator. It speaks the wire protocol with `gen_tcp` and the `chat_ws` functions from lesson 18, and puts the send time in the message text, so the copy the room broadcasts back gives a round trip.
+
+```erlang
+1> chat_load:run(#{port => 8080, clients => 1000, start_gap => 60,
+1>                 room_size => 20, messages => 20, interval => 1000}).
+#{replies => 20000,errors => [],clients => 1000,failed => 0,max_us => 5286,
+  p50_us => 355,p99_us => 1151}
+```
+
+A thousand clients in 52 rooms, 20,000 messages fanned out to 20 members each, a median round trip of 355 microseconds, nothing failed. Once the numbers get interesting, move the generator to a second machine. It competes for the same cores.
+
+The first thing that broke was not the sockets. `start_gap` sets how fast clients arrive, and below 40 ms `chat_auth` answered with call timeouts. Its login path runs 100,000 PBKDF2 rounds, which `timer:tc/1` puts at 12.5 ms, so one gen_server manages about 86 logins per second. Hashing is meant to be slow, so move it out of the server process instead of weakening it.
+
+## More Nodes
+
+One node has a ceiling. Put a TCP load balancer in front and run several. Lessons 31 and 32 already made that safe, so no sticky sessions are needed. Rooms span nodes through `pg`, sessions live in a replicated table, and any node can serve any client.
+
+Long-lived connections change how a new node fills up. A web server behind a balancer gets its share of traffic in seconds. A chat node only receives clients that connect after it started, so it stays nearly empty until something disconnects the others. Scaling out during a spike is slow, and after one it does nothing. Deploys are expensive for the same reason, because a restart moves every connection on that node at once. Lesson 36 drains a node before stopping it.
+
+Distributed Erlang connects every node to every other, so `N` nodes hold `N * (N - 1) div 2` links. That is fine for tens of nodes and wrong for thousands. Past that point, shard. Give each group of nodes its own rooms, route a client to the shard owning its room, and let shards talk over something other than distribution.
+
+## Exercises
+
+**Exercise 1: Measure your own connection cost**
+
+Write `scale_probe:idle(Port, N)` that opens N WebSocket connections and holds them, then compare `erlang:memory(total)` before and after.
+
+```erlang
+% Collect first: [erlang:garbage_collect(P) || P <- processes()]
+% Expected: a number in the range of the table above
+```
+
+**Exercise 2: Backpressure instead of dropping**
+
+Stop sending chat events above 200 queued and resume below 100, with one `system` event to say so.
+
+```erlang
+% Two thresholds, not one, so the connection does not flap
+% Expected: a slow client stays connected and knows it missed messages
+```
+
+**Exercise 3: Hash off the server process**
+
+Move the PBKDF2 call out of `chat_auth`. Keep the state in the gen_server, return `{noreply, ...}`, and let a spawned process hash and `gen_server:reply/2`.
+
+```erlang
+% chat_load:run with start_gap => 5 should stop producing call timeouts
+% Expected: logins limited by cores, not by one process
+```
+
+## Key Takeaways
+
+- **Descriptors run out before processes do.** `ulimit -n` is the real cap, `+Q` only sizes a table inside the VM
+- **Handle `{error, emfile}` in the acceptor.** Crashing does not give the descriptors back
+- **Measure memory per connection.** Most of the default 13 KB is socket buffer, not process
+- **`backlog` beats acceptor count** in a connection storm. Add acceptors when the work between accepts is not free
+- **`send_timeout` bounds a stalled client**, and `message_queue_len` names who is falling behind
+- **A load generator finds the real bottleneck**, here one gen_server running PBKDF2
+- **Long-lived connections fill new nodes slowly**, so scale out early and drain before a deploy
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l35_accept_emfile",
+      question: "Which error reason means the acceptor ran out of file descriptors?",
+      code: "accept_loop(ListenSocket) ->\n    case chat_transport:accept(ListenSocket) of\n        {ok, Socket} ->\n            {ok, Pid} = chat_conn_sup:start_connection(Socket),\n            chat_connection:socket_ready(Pid);\n        {error, ___} ->\n            receive after 200 -> ok end\n    end,\n    accept_loop(ListenSocket).",
+      answer: "emfile",
+      hint: "The name comes from the C errno for too many open files.",
+      explanation: "Crashing on emfile restarts the acceptor into the same wall, so the loop waits instead."
+    },
+    {
+      id: "l35_memory_per_conn",
+      question: "Total memory grew from 50 MB to 76 MB over 2000 connections. What is the cost of one?",
+      code: "per_connection(Before, After, Count) ->\n    (After - Before) div Count.\n\nper_connection(50000000, 76000000, 2000).\n% => ___",
+      answer: "13000",
+      hint: "Divide the difference by the number of connections.",
+      explanation: "Garbage collect before the first reading, or you measure garbage."
+    },
+    {
+      id: "l35_percentile",
+      question: "Which lists function picks the percentile out of the sorted latencies?",
+      code: "percentile(P, Sorted) ->\n    lists:___(max(1, ceil(length(Sorted) * P / 100)), Sorted).\n\npercentile(50, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]).\n% => 5\npercentile(99, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]).\n% => 10",
+      answer: "nth",
+      hint: "It returns the element at a position in a list.",
+      explanation: "A median hides the clients that suffer. The p99 describes the worst hundredth of them."
+    },
+    {
+      id: "l35_queue_len",
+      question: "Seven events are waiting. What does the mailbox length report?",
+      code: "[self() ! {chat_event, N} || N <- lists:seq(1, 7)].\nprocess_info(self(), message_queue_len).\n% => {message_queue_len, ___}",
+      answer: "7",
+      hint: "Nothing has been received yet, so every message is still queued.",
+      explanation: "Every queued event holds its payload in memory. This is the cheapest early warning that a connection is falling behind."
+    },
+    {
+      id: "l35_drop_rule",
+      question: "The threshold is 1000 and the mailbox holds 1200 events. What does the rule decide?",
+      code: "deliver(Queued, Max) when Queued > Max -> drop;\ndeliver(_Queued, _Max) -> send.\n\ndeliver(120, 1000).\n% => send\ndeliver(1200, 1000).\n% => ___",
+      answer: "drop",
+      hint: "Past the threshold the connection is too far behind to catch up.",
+      explanation: "One slow reader must not cost the node gigabytes. The client from lesson 32 reconnects with backoff."
+    },
+    {
+      id: "l35_send_timeout_close",
+      question: "Which option closes a socket whose send timed out, instead of leaving it half dead?",
+      code: "Options = [binary, {packet, raw}, {active, false}, {reuseaddr, true},\n           {backlog, 1024}, {send_timeout, 5000}, {___, true}].\nlength(Options).\n% => 7",
+      answer: "send_timeout_close",
+      hint: "Its name is the timeout option plus what it does afterwards.",
+      explanation: "After a send timeout the stream is in an unknown state, so the only safe move is to close it and let the client reconnect."
+    }
+  ]}
+/>

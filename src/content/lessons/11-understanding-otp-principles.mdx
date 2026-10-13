@@ -1,0 +1,333 @@
+---
+title: "Understanding OTP Principles"
+description: "Split a hand-written server into generic and specific parts to see what an OTP behaviour is and how OTP systems are organized"
+postNumber: 11
+publishDate: 2026-09-19T00:00:00Z
+tags: ["intermediate", "otp", "behaviours"]
+difficulty: "intermediate"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+The `chat_room` process from lesson 09 had a familiar shape. Spawn a process, enter a loop, receive a message, maybe reply, loop again with new state. A counter or a key-value store would look the same, with different messages and state. OTP is the set of libraries and conventions that ships with Erlang, and its central idea is to write that shared shape once and reuse it.
+
+## The Same Loop Every Time
+
+Some parts of `chat_room` had nothing to do with chat. Spawning and entering the loop, sending `{call, From, Ref, Request}` and waiting for `{Ref, Reply}`, the `receive` that recurses with new state. All of that is plumbing. It is also where subtle bugs live. A forgotten timeout makes a caller hang forever. A missing monitor makes a caller wait on a dead server. We'll put the plumbing in one module and never write it again.
+
+## A Generic Server
+
+`my_server` knows nothing about chat. It takes a module name and calls three functions in that module. `init/1` builds the first state, `handle_call/2` answers a request, and `handle_cast/2` handles a message that needs no answer.
+
+**Create `my_server.erl`:**
+
+```erlang
+-module(my_server).
+-export([start/2, call/2, cast/2]).
+
+start(Module, Args) ->
+    spawn(fun() ->
+        {ok, State} = Module:init(Args),
+        loop(Module, State)
+    end).
+
+call(Server, Request) ->
+    Ref = monitor(process, Server),
+    Server ! {call, {self(), Ref}, Request},
+    receive
+        {Ref, Reply} ->
+            demonitor(Ref, [flush]),
+            Reply;
+        {'DOWN', Ref, process, _Pid, Reason} ->
+            exit({server_down, Reason})
+    after 5000 ->
+        demonitor(Ref, [flush]),
+        exit(timeout)
+    end.
+
+cast(Server, Msg) ->
+    Server ! {cast, Msg},
+    ok.
+
+loop(Module, State) ->
+    receive
+        {call, {From, Ref}, Request} ->
+            {reply, Reply, NewState} = Module:handle_call(Request, State),
+            From ! {Ref, Reply},
+            loop(Module, NewState);
+        {cast, Msg} ->
+            {noreply, NewState} = Module:handle_cast(Msg, State),
+            loop(Module, NewState)
+    end.
+```
+
+`Module` is a variable that holds an atom, and `Module:init(Args)` calls `init/1` in whatever module that atom names. Generic code reaches specific code this way.
+
+`call/2` does more than the `call` helper from lesson 09. The monitor reference doubles as the request tag. If the server dies before it replies, the `'DOWN'` message arrives and the caller exits with a clear reason. If the server is stuck, the caller gives up after five seconds. `demonitor(Ref, [flush])` removes the monitor and also deletes a `'DOWN'` message that may already sit in the mailbox.
+
+## A Short Detour Into Maps
+
+The callback module below keeps its state in a map, a key-value data type we have not used yet. Later lessons use maps everywhere.
+
+```erlang
+1> Users = #{alice => online, bob => away}.
+#{alice => online,bob => away}
+2> maps:get(alice, Users).
+online
+3> maps:get(carol, Users, offline).
+offline
+4> maps:find(carol, Users).
+error
+5> Users2 = Users#{carol => online}.
+#{alice => online,bob => away,carol => online}
+6> Users2#{bob := online}.
+#{alice => online,bob => online,carol => online}
+7> Users#{dave := online}.
+** exception error: bad key: dave
+8> #{alice := Status} = Users.
+#{alice => online,bob => away}
+9> Status.
+online
+10> maps:remove(bob, Users2).
+#{alice => online,carol => online}
+11> maps:keys(Users2).
+[alice,bob,carol]
+```
+
+`#{}` is the empty map. `Map#{Key => Value}` returns a new map with the key added or replaced. The original is unchanged. `:=` only updates a key that exists and fails otherwise, which catches typos. In a pattern, only `:=` is allowed, and the pattern matches any map that contains the listed keys. `maps:get/2` crashes on a missing key, `maps:get/3` takes a default, and `maps:find/2` returns `{ok, Value}` or `error`. `maps:put/3` is the function form of `=>`.
+
+## A Callback Module
+
+The specific part is now small. `kv_store` has no `spawn`, no `receive` and no `!`.
+
+**Create `kv_store.erl`:**
+
+```erlang
+-module(kv_store).
+-export([start/0, put/3, get/2, delete/2]).
+-export([init/1, handle_call/2, handle_cast/2]).
+
+%% Client API
+
+start() ->
+    my_server:start(?MODULE, []).
+
+put(Server, Key, Value) ->
+    my_server:cast(Server, {put, Key, Value}).
+
+get(Server, Key) ->
+    my_server:call(Server, {get, Key}).
+
+delete(Server, Key) ->
+    my_server:cast(Server, {delete, Key}).
+
+%% Callbacks
+
+init([]) ->
+    {ok, #{}}.
+
+handle_call({get, Key}, State) ->
+    {reply, maps:find(Key, State), State}.
+
+handle_cast({put, Key, Value}, State) ->
+    {noreply, State#{Key => Value}};
+handle_cast({delete, Key}, State) ->
+    {noreply, maps:remove(Key, State)}.
+```
+
+The module has two halves. The client API functions run in the caller's process and hide the message format. The callbacks run inside the server process, because `loop/2` calls them. Each callback is a plain function from old state to new state, which makes it easy to test.
+
+```erlang
+1> c(my_server).
+{ok,my_server}
+2> c(kv_store).
+{ok,kv_store}
+3> Store = kv_store:start().
+<0.96.0>
+4> kv_store:put(Store, alice, online).
+ok
+5> kv_store:put(Store, bob, away).
+ok
+6> kv_store:get(Store, alice).
+{ok,online}
+7> kv_store:delete(Store, alice).
+ok
+8> kv_store:get(Store, alice).
+error
+```
+
+A request that `handle_call/2` has no clause for crashes the server. The monitor in `call/2` tells the caller right away.
+
+```erlang
+9> my_server:call(Store, {unknown, request}).
+** exception exit: {server_down,
+                       {function_clause,
+                           [{kv_store,handle_call,
+                                [{unknown,request},#{bob => away}],
+                                [{file,"kv_store.erl"},{line,24}]},
+                            {my_server,loop,2,
+                                [{file,"my_server.erl"},{line,31}]}]}}
+     in function  my_server:call/2 (my_server.erl:18)
+```
+
+## Behaviours
+
+A generic module plus a contract for the callback module is what OTP calls a behaviour. The contract is written with `-callback` attributes in the generic module.
+
+```erlang
+%% In my_server.erl
+-callback init(Args :: term()) -> {ok, State :: term()}.
+-callback handle_call(Request :: term(), State :: term()) ->
+    {reply, Reply :: term(), NewState :: term()}.
+-callback handle_cast(Msg :: term(), State :: term()) ->
+    {noreply, NewState :: term()}.
+```
+
+A callback module declares which contract it follows with `-behaviour(my_server).` under its `-module` line. Add that line to `kv_store` now. The compiler then checks that every required callback is exported. Here is a module that forgot `handle_cast/2`.
+
+```erlang
+-module(presence).
+-behaviour(my_server).
+
+-export([init/1, handle_call/2]).
+
+init([]) ->
+    {ok, #{}}.
+
+handle_call({status, User}, State) ->
+    {reply, maps:get(User, State, offline), State}.
+```
+
+```erlang
+1> c(presence).
+presence.erl:2:2: Warning: undefined callback function handle_cast/2 (behaviour 'my_server')
+%    2| -behaviour(my_server).
+%     |  ^
+
+{ok,presence}
+```
+
+It is only a warning. The module loads, and the server crashes the first time someone casts to it. Treat behaviour warnings as bugs.
+
+## What gen_server Adds
+
+OTP's `gen_server` is `my_server` with decades of production use behind it. It has the same structure, with `gen_server:call/2`, `gen_server:cast/2` and the callbacks `init/1`, `handle_call/3` and `handle_cast/2`. It also handles the cases we skipped.
+
+- Messages that are neither calls nor casts go to a `handle_info/2` callback
+- Callbacks can stop the server, and a `terminate/2` callback runs on the way out
+- Servers can be registered under a name and linked to a parent
+- System messages let tools such as `sys:get_state/1` inspect or suspend any behaviour process
+- A `code_change/3` callback upgrades the state when new code is loaded
+- Crashes produce log reports with the last message and the state
+
+Lesson 12 moves to `gen_server`, and we'll stop using `my_server`.
+
+## OTP Vocabulary
+
+**Behaviours.** The standard ones are `gen_server` (a server with state), `supervisor` (starts and restarts other processes), `application` (starts and stops a whole component), `gen_statem` (a state machine) and `gen_event` (an event manager with pluggable handlers).
+
+**Supervision trees.** OTP processes are either workers or supervisors. Workers do the work. Supervisors only start, watch and restart their children, and a child can be another supervisor. The result is a tree. `keeper` from lesson 10 was a tiny supervisor.
+
+**Applications.** An application is a component with a name, a version, a list of modules and usually one supervision tree. You already have one. In lesson 00, `src/chat_server.app.src` described the `chat_server` application, and its `mod` entry pointed at `chat_server_app`. That module starts with `-behaviour(application).` and exports the two callbacks of that behaviour, `start/2` and `stop/1`. `start/2` must return the pid of the top of the supervision tree. Ours returns a placeholder process for now. Lesson 14 replaces it with a real supervisor.
+
+**Releases.** A release bundles your applications, their OTP dependencies and the Erlang runtime into one directory you can copy to a server. Lesson 25 builds one.
+
+## Exercises
+
+**Exercise 1: A Callback Module for Counters**
+
+Write `hit_counter` as a callback module for `my_server`. A cast of `{hit, Page}` adds one to the count for that page. A call of `{count, Page}` returns the count, or 0 for an unknown page.
+
+```erlang
+% Expected:
+% C = hit_counter:start().
+% hit_counter:hit(C, home), hit_counter:hit(C, home).
+% hit_counter:count(C, home).   => 2
+% hit_counter:count(C, about).  => 0
+```
+
+**Exercise 2: Call With a Timeout Argument**
+
+Add `call/3` to `my_server` that takes the timeout in milliseconds as a third argument, and make `call/2` use it with 5000. Test it with a callback that sleeps in `handle_call/2`.
+
+```erlang
+%% In my_server.erl
+call(Server, Request) ->
+    call(Server, Request, 5000).
+
+% Expected: my_server:call(Slow, {sleep, 2000}, 500) exits with timeout
+```
+
+**Exercise 3: Plain Messages**
+
+`my_server:loop/2` ignores messages that are not calls or casts, so they pile up in the mailbox. Add a third `receive` clause that passes any other message to `Module:handle_info(Msg, State)` and expects `{noreply, NewState}`. Add the matching `-callback` line.
+
+```erlang
+% Expected: Store ! hello. reaches kv_store:handle_info(hello, State)
+```
+
+## Key Takeaways
+
+- **Generic and specific** parts of a server can live in separate modules. The generic part owns the process, the loop and the message protocol
+- **Callback modules** contain plain functions that turn a request and a state into a reply and a new state
+- **A behaviour** is a generic module plus a contract declared with `-callback` attributes
+- **`-behaviour(Name)`** makes the compiler warn about missing callbacks. It does not change how the module runs
+- **`gen_server`** has the same structure as `my_server` and handles timeouts, dead servers, system messages, shutdown and code upgrades
+- **Supervision trees** are built from workers that do the work and supervisors that restart them
+- **Applications** package modules and a supervision tree. The `chat_server` project from lesson 00 already is one
+- **Releases** bundle applications and the runtime for deployment
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l11_callback_reply_value",
+      question: "What reply does this callback produce for the request?",
+      code: "handle_call({get, Key}, State) ->\n    {reply, maps:get(Key, State, offline), State}.\n\nhandle_call({get, alice}, #{alice => online}).\n% => {reply, ___, #{alice => online}}",
+      answer: "online",
+      hint: "maps:get/3 returns the stored value when the key exists.",
+      explanation: "The callback looks up alice in the state map and puts the value in the second element of the reply tuple. The state is returned unchanged."
+    },
+    {
+      id: "l11_map_update_lookup",
+      question: "What does the lookup return after the map update?",
+      code: "Users = #{alice => online}.\nUsers2 = Users#{alice => away, bob => online}.\nmaps:get(alice, Users2).\n% => ___",
+      answer: "away",
+      hint: "The => operator replaces the value of a key that already exists.",
+      explanation: "Users2 is a new map in which alice is away and bob was added. Users itself still maps alice to online."
+    },
+    {
+      id: "l11_module_variable",
+      question: "Which module name makes the dynamic call reverse the list?",
+      code: "Module = ___.\nModule:reverse([1, 2, 3]).\n% => [3,2,1]",
+      answer: "lists",
+      hint: "A module name is an atom, and an atom can be stored in a variable.",
+      explanation: "Module:reverse(...) calls reverse in whatever module the atom names. my_server uses the same mechanism to call Module:init and Module:handle_call."
+    },
+    {
+      id: "l11_application_behaviour",
+      question: "Which behaviour does the module from lesson 00 declare?",
+      code: "-behaviour(___).\n\nstart(_StartType, _StartArgs) ->\n    {ok, spawn(fun() -> receive stop -> ok end end)}.\n\nstop(_State) ->\n    ok.",
+      answer: "application",
+      hint: "start/2 and stop/1 are the callbacks of the behaviour that starts a whole component.",
+      explanation: "chat_server_app implements the application behaviour. OTP calls start/2 when the chat_server application boots."
+    },
+    {
+      id: "l11_generic_loop_state",
+      question: "What does the second call return?",
+      code: "loop(Module, State) ->\n    receive\n        {call, From, Request} ->\n            {reply, Reply, NewState} = Module:handle_call(Request, State),\n            From ! {reply, Reply},\n            loop(Module, NewState)\n    end.\n\nhandle_call(next, N) ->\n    {reply, N, N + 1}.\n\nPid = spawn(fun() -> loop(?MODULE, 10) end).\nPid ! {call, self(), next}.\nreceive {reply, First} -> First after 1000 -> timeout end.\n% => 10\nPid ! {call, self(), next}.\nreceive {reply, Second} -> Second after 1000 -> timeout end.\n% => ___",
+      answer: "11",
+      hint: "The loop recurses with NewState, not State.",
+      explanation: "The first call replies 10 and returns 11 as the new state. The generic loop carries that state into the next receive, so the second reply is 11."
+    },
+    {
+      id: "l11_call_dead_server",
+      question: "What does call/2 return when the server is already dead?",
+      code: "call(Server, Request) ->\n    Ref = monitor(process, Server),\n    Server ! {call, {self(), Ref}, Request},\n    receive\n        {Ref, Reply} -> Reply;\n        {'DOWN', Ref, process, _Pid, _Reason} -> server_down\n    after 1000 ->\n        timeout\n    end.\n\nServer = spawn(fun() -> ok end).\ntimer:sleep(50).\ncall(Server, ping).\n% => ___",
+      answer: "server_down",
+      hint: "Monitoring a dead process delivers a 'DOWN' message immediately.",
+      explanation: "The monitor fires at once with reason noproc, so the caller does not wait for the timeout. gen_server:call uses the same trick."
+    }
+  ]}
+/>

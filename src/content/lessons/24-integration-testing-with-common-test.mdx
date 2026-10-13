@@ -1,0 +1,367 @@
+---
+title: "Integration Testing with Common Test"
+description: "Boot the whole chat server in a Common Test suite and test it over real sockets"
+postNumber: 24
+publishDate: 2026-09-19T00:00:00Z
+tags: ["advanced", "testing", "common-test"]
+difficulty: "advanced"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+The EUnit tests from lesson 23 check one module at a time. None of them would notice if the supervisor started the listener before the registry. An integration test boots the whole application and talks to it through a TCP socket, the way a browser does. OTP ships a second framework for this job, Common Test.
+
+## What Common Test Adds
+
+Common Test (CT) was built for running systems, where a test needs a booted application, open sockets and several steps in a row. A test module is called a suite and its name ends in `_SUITE`. `init_per_suite/1` runs once and `init_per_testcase/2` runs before every case. Each receives a `Config` proplist, adds to it and returns it, and every test case takes that `Config` as its argument. Groups bundle cases and give them properties such as `parallel`.
+
+## A Scripted WebSocket Client
+
+The suite needs a client. `gen_tcp` opens the socket, and `chat_ws` already knows frames. A client must mask its frames, though, and `encode_frame/1` writes unmasked ones. `send_frame/2` encodes a payload of zeros to get the header, sets the mask bit, and appends the key and the masked payload.
+
+**Create `test/ws_client.erl`:**
+
+```erlang
+-module(ws_client).
+-export([http_get/2, connect/1, send_frame/2, send_json/2,
+         recv_frame/1, recv_json/1, wait_for/2]).
+
+-define(TIMEOUT, 2000).
+
+http_get(Port, Path) ->
+    {ok, Socket} = gen_tcp:connect("localhost", Port, [binary, {active, false}]),
+    ok = gen_tcp:send(Socket, [<<"GET ">>, Path, <<" HTTP/1.1\r\nHost: localhost\r\n\r\n">>]),
+    read_all(Socket, <<>>).
+
+read_all(Socket, Acc) ->
+    case gen_tcp:recv(Socket, 0, ?TIMEOUT) of
+        {ok, Data} -> read_all(Socket, <<Acc/binary, Data/binary>>);
+        {error, closed} -> Acc
+    end.
+
+connect(Port) ->
+    {ok, Socket} = gen_tcp:connect("localhost", Port, [binary, {active, false}]),
+    Key = base64:encode(crypto:strong_rand_bytes(16)),
+    ok = gen_tcp:send(Socket, [
+        <<"GET /ws HTTP/1.1\r\nHost: localhost\r\n">>,
+        <<"Connection: Upgrade\r\nUpgrade: websocket\r\n">>,
+        <<"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ">>, Key, <<"\r\n\r\n">>]),
+    {ok, Response, Rest} = read_headers(Socket, <<>>),
+    <<"HTTP/1.1 101 ", _/binary>> = Response,
+    {_, _} = binary:match(Response, chat_ws:accept_key(Key)),
+    put({ws_buffer, Socket}, Rest),
+    {ok, Socket}.
+
+read_headers(Socket, Buffer) ->
+    case binary:split(Buffer, <<"\r\n\r\n">>) of
+        [Response, Rest] ->
+            {ok, Response, Rest};
+        [_Incomplete] ->
+            {ok, Data} = gen_tcp:recv(Socket, 0, ?TIMEOUT),
+            read_headers(Socket, <<Buffer/binary, Data/binary>>)
+    end.
+
+send_frame(Socket, {Type, Payload}) ->
+    Len = byte_size(Payload),
+    Frame = iolist_to_binary(chat_ws:encode_frame({Type, binary:copy(<<0>>, Len)})),
+    <<First:8, 0:1, LenBits/bits>> = binary:part(Frame, 0, byte_size(Frame) - Len),
+    Key = crypto:strong_rand_bytes(4),
+    gen_tcp:send(Socket, [<<First:8, 1:1, LenBits/bits>>, Key, chat_ws:mask(Payload, Key)]).
+
+send_json(Socket, Map) ->
+    send_frame(Socket, {text, iolist_to_binary(json:encode(Map))}).
+
+recv_frame(Socket) ->
+    Buffer = get({ws_buffer, Socket}),
+    case chat_ws:decode_frame(Buffer) of
+        {ok, Frame, Rest} ->
+            put({ws_buffer, Socket}, Rest),
+            Frame;
+        more ->
+            case gen_tcp:recv(Socket, 0, ?TIMEOUT) of
+                {ok, Data} ->
+                    put({ws_buffer, Socket}, <<Buffer/binary, Data/binary>>),
+                    recv_frame(Socket);
+                {error, Reason} ->
+                    Reason
+            end
+    end.
+
+recv_json(Socket) ->
+    case recv_frame(Socket) of
+        {text, Text} -> json:decode(Text);
+        Other -> Other
+    end.
+
+wait_for(Socket, Type) ->
+    case recv_json(Socket) of
+        #{<<"type">> := Type} = Message -> Message;
+        Skipped when is_map(Skipped) -> wait_for(Socket, Type);
+        Other -> error({wait_for, Type, Other})
+    end.
+```
+
+A TCP read can return one and a half frames, so leftover bytes have to live somewhere. Returning a new client term from every call would turn each test line into `{Reply, Client2} = ...`, so the buffer goes into the process dictionary, a per-process key-value store behind `put/2` and `get/1`. The price is one rule. Only the process that connected a socket may use it. `wait_for/2` skips system messages such as "bob joined", so a test does not depend on how many arrive first.
+
+## The Suite
+
+**Create `test/chat_SUITE.erl`:**
+
+```erlang
+-module(chat_SUITE).
+-include_lib("common_test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
+
+-export([all/0, groups/0, init_per_suite/1, end_per_suite/1,
+         init_per_testcase/2]).
+-export([index_page/1, unknown_path/1, upgrade/1, message_before_auth/1,
+         register_and_login/1, two_clients/1, history_on_join/1,
+         disconnect_removes_user/1]).
+
+-define(PORT, 8080).
+
+all() ->
+    [{group, http}, {group, chat}].
+
+groups() ->
+    [{http, [parallel], [index_page, unknown_path, upgrade]},
+     {chat, [], [message_before_auth, register_and_login, two_clients,
+                 history_on_join, disconnect_removes_user]}].
+
+init_per_suite(Config) ->
+    {ok, Started} = application:ensure_all_started(chat_server),
+    [{started, Started} | Config].
+
+end_per_suite(Config) ->
+    [application:stop(App) || App <- lists:reverse(?config(started, Config))],
+    ok.
+
+init_per_testcase(Case, Config) ->
+    N = integer_to_binary(erlang:unique_integer([positive])),
+    Name = <<"user_", N/binary>>,
+    ct:pal("~p runs as ~s", [Case, Name]),
+    [{username, Name} | Config].
+
+index_page(_Config) ->
+    Response = ws_client:http_get(?PORT, <<"/">>),
+    <<"HTTP/1.1 200 OK\r\n", _/binary>> = Response,
+    {_, _} = binary:match(Response, <<"Content-Type: text/html">>).
+
+unknown_path(_Config) ->
+    Response = ws_client:http_get(?PORT, <<"/nope">>),
+    [StatusLine | _] = binary:split(Response, <<"\r\n">>),
+    ?assertEqual(<<"HTTP/1.1 404 Not Found">>, StatusLine).
+
+upgrade(_Config) ->
+    {ok, Client} = ws_client:connect(?PORT),
+    ws_client:send_frame(Client, {ping, <<"hello">>}),
+    ?assertEqual({pong, <<"hello">>}, ws_client:recv_frame(Client)).
+
+message_before_auth(_Config) ->
+    {ok, Client} = ws_client:connect(?PORT),
+    ws_client:send_json(Client, #{type => message, room => <<"lobby">>, text => <<"hi">>}),
+    ?assertEqual(#{<<"type">> => <<"error">>, <<"reason">> => <<"not_authenticated">>},
+                 ws_client:recv_json(Client)).
+
+register_and_login(Config) ->
+    Name = ?config(username, Config),
+    _Client = login(Name),
+    ?assert(lists:member(Name, chat_room:members(<<"lobby">>))).
+
+two_clients(Config) ->
+    Alice = ?config(username, Config),
+    Bob = <<Alice/binary, "_b">>,
+    A = login(Alice),
+    B = login(Bob),
+    ws_client:send_json(A, #{type => message, room => <<"lobby">>, text => <<"hi bob">>}),
+    ?assertMatch(#{<<"from">> := Alice, <<"text">> := <<"hi bob">>},
+                 ws_client:wait_for(B, <<"message">>)),
+    ws_client:send_json(B, #{type => message, room => <<"lobby">>, text => <<"hi alice">>}),
+    #{<<"from">> := Alice} = ws_client:wait_for(A, <<"message">>),
+    ?assertMatch(#{<<"from">> := Bob, <<"text">> := <<"hi alice">>},
+                 ws_client:wait_for(A, <<"message">>)).
+
+history_on_join(Config) ->
+    Alice = ?config(username, Config),
+    Room = <<"room_", Alice/binary>>,
+    A = login(Alice),
+    ws_client:send_json(A, #{type => join, room => Room}),
+    #{<<"history">> := []} = ws_client:wait_for(A, <<"joined">>),
+    ws_client:send_json(A, #{type => message, room => Room, text => <<"first">>}),
+    ws_client:wait_for(A, <<"message">>),
+    B = login(<<Alice/binary, "_b">>),
+    ws_client:send_json(B, #{type => join, room => Room}),
+    #{<<"history">> := History} = ws_client:wait_for(B, <<"joined">>),
+    ?assertMatch([#{<<"from">> := Alice, <<"text">> := <<"first">>}], History).
+
+disconnect_removes_user(Config) ->
+    Name = ?config(username, Config),
+    Client = login(Name),
+    ?assert(lists:member(Name, chat_registry:list_users())),
+    gen_tcp:close(Client),
+    ok = wait_until(fun() -> not lists:member(Name, chat_registry:list_users()) end, 50).
+
+login(Name) ->
+    {ok, Client} = ws_client:connect(?PORT),
+    Credentials = #{username => Name, password => <<"correct horse">>},
+    ws_client:send_json(Client, Credentials#{type => register}),
+    #{<<"type">> := <<"register_ok">>} = ws_client:recv_json(Client),
+    ws_client:send_json(Client, Credentials#{type => login}),
+    #{<<"type">> := <<"login_ok">>, <<"username">> := Name} = ws_client:recv_json(Client),
+    #{<<"room">> := <<"lobby">>} = ws_client:wait_for(Client, <<"joined">>),
+    Client.
+
+wait_until(_Check, 0) ->
+    {error, gave_up};
+wait_until(Check, Attempts) ->
+    case Check() of
+        true -> ok;
+        false -> timer:sleep(20), wait_until(Check, Attempts - 1)
+    end.
+```
+
+`all/0` lists what runs, and `groups/0` defines each group as `{Name, Properties, Cases}`. The `http` cases share nothing, so they run in `parallel`, each in its own process. The `chat` group runs in order. A third property, `sequence`, skips the rest of a group after the first failure, which independent cases do not need.
+
+`init_per_suite/1` boots the application with `application:ensure_all_started/1`, which starts `crypto` first. `end_per_suite/1` stops exactly the applications it started. `?config(Key, Config)` is a short form of `proplists:get_value/2`. If `init_per_suite/1` crashes, CT skips every case. A `rebar3 shell` holding port 8080 in another terminal causes that.
+
+The server keeps accounts for the whole run, so a second case that registers `<<"alice">>` would get `username_taken`. `init_per_testcase/2` builds a name from `erlang:unique_integer([positive])`, which never returns the same value twice in one VM. `ct:pal/2` works like `io:format/2` and writes to the log page of the running case.
+
+A case passes when it returns and fails when it crashes, so a match is an assertion. A failed match reports a `badmatch` with the actual value. The macros from `stdlib/include/assert.hrl` are the ones EUnit uses, and they also show the expected value. `login/1` matches its steps, and the cases use macros for the fact under test. The suite runs in the same VM as the server, so a case can also call `chat_room` or `chat_registry` directly.
+
+`disconnect_removes_user/1` has the timing problem from lesson 23. The registry handles the `'DOWN'` message of the connection a moment after the close, and no message tells the test when that is done. `wait_until/2` polls and gives up after 50 attempts. Unlike a bare sleep it returns as soon as the condition holds, and the bound only matters when the code is broken.
+
+## Running the Suite
+
+```bash
+$ rebar3 ct
+%%% chat_SUITE: Chat server listening on port 8080
+........
+All 8 tests passed.
+```
+
+To see a failure, change the expected status line in `unknown_path/1` to `<<"HTTP/1.1 404 Not Here">>`.
+
+```bash
+$ rebar3 ct
+..
+unknown_path runs as user_1156
+
+%%% chat_SUITE ==> http.unknown_path: FAILED
+Failure/Error: ?assertEqual(<<72,84,84,80,47,49,46,49,32,52,48,52,32,78,111,116,32,72,101,114,101>>, StatusLine)
+  expected: <<"HTTP/1.1 404 Not Here">>
+       got: <<"HTTP/1.1 404 Not Found">>
+      line: 43
+.....
+Failed 1 tests. Passed 7 tests.
+```
+
+The `ct:pal/2` lines stay out of the terminal when everything passes and show up next to a failure. The other seven cases still ran.
+
+Open `_build/test/logs/index.html` in a browser. Each run links down to one page per test case. A case page shows the `Config` it received, the `ct:pal/2` output, the return value or the crash reason, and a link to the failing line in a copy of the suite.
+
+Run less while working on one feature.
+
+```bash
+$ rebar3 ct --suite=test/chat_SUITE
+$ rebar3 ct --suite=test/chat_SUITE --group=chat
+$ rebar3 ct --suite=test/chat_SUITE --case=two_clients
+```
+
+`--group` and `--case` need `--suite`. `init_per_suite/1` runs every time.
+
+## Dividing the Work
+
+EUnit covers pure modules and single processes. The CT suite checks what those tests cannot see. The supervision tree boots, and a login over a socket reaches the registry and the lobby. When a CT case fails and all unit tests pass, the bug is in the wiring between modules. Keep edge cases in EUnit and one CT case per user-visible flow. `rebar3 do eunit, ct` runs both layers with one command.
+
+## Exercises
+
+**Exercise 1: Wrong password**
+
+Add `wrong_password/1` to the `chat` group. Register a user, then log in with a different password.
+
+```erlang
+% Expected reply to the login:
+% #{<<"type">> => <<"error">>, <<"reason">> => <<"invalid_credentials">>}
+% The name must not appear in chat_registry:list_users()
+```
+
+**Exercise 2: A connected client per case**
+
+For the `chat` group, call `login/1` in `init_per_testcase/2`, store the socket as `{client, Client}` in `Config`, and close it with `gen_tcp:close/1` in `end_per_testcase/2`. CT runs both in the test case process, so the buffered bytes stay reachable. The group name is in `?config(tc_group_properties, Config)`.
+
+```erlang
+% Expected: cases start with Client = ?config(client, Config)
+% and rebar3 ct still reports 8 passing tests
+```
+
+**Exercise 3: Make the chat group parallel**
+
+Change the `chat` group properties to `[parallel]` and run `rebar3 ct --repeat 10`. Then explain why `two_clients/1` uses `wait_for/2` instead of matching on the next message.
+
+```erlang
+% Expected: All 8 tests passed, ten times
+```
+
+## Key Takeaways
+
+- **Integration tests check wiring.** A CT case talks to the booted application over a real socket
+- **A suite is a module named `*_SUITE`** with `all/0`, optional `groups/0`, and cases that take `Config`
+- **`Config` flows downward.** Fixtures prepend tuples, and cases read them with `?config/2`
+- **A failed match is a failed case.** Use `?assertEqual` where the report should show both values
+- **Unique names keep cases independent**
+- **Poll with a bound instead of sleeping**, and read `_build/test/logs/index.html` after a failure
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l24_boot_the_app",
+      question: "Which function starts chat_server and the applications it depends on?",
+      code: "init_per_suite(Config) ->\n    {ok, Started} = application:___(chat_server),\n    [{started, Started} | Config].",
+      answer: "ensure_all_started",
+      hint: "application:start/1 fails while crypto is not running.",
+      explanation: "It starts the dependencies first and returns the applications it started."
+    },
+    {
+      id: "l24_init_per_testcase_value",
+      question: "The test case receives what init_per_testcase/2 returns. What does it read here?",
+      code: "init_per_testcase(Case, Config) ->\n    [{room, Case} | Config].\n\nConfig = init_per_testcase(two_clients, [{port, 8080}]).\nproplists:get_value(room, Config).\n% => ___",
+      answer: "two_clients",
+      hint: "The first argument is the name of the test case.",
+      explanation: "The function prepends {room, two_clients}, and the case finds it under the key room."
+    },
+    {
+      id: "l24_newest_value_wins",
+      question: "A fixture prepends a key that already exists. Which value does the test case see?",
+      code: "SuiteConfig = [{username, alice}].\nConfig = [{username, bob} | SuiteConfig].\nproplists:get_value(username, Config).\n% => ___",
+      answer: "bob",
+      hint: "The lookup stops at the first match.",
+      explanation: "Prepending shadows older entries, so fixtures add to the front of Config."
+    },
+    {
+      id: "l24_match_is_assertion",
+      question: "A case expects login_ok, but the server sent an error. Which error does the match raise?",
+      code: "Reply = #{<<\"type\">> => <<\"error\">>}.\ntry\n    #{<<\"type\">> := <<\"login_ok\">>} = Reply,\n    passed\ncatch\n    error:{Reason, _Value} -> Reason\nend.\n% => ___",
+      answer: "badmatch",
+      hint: "The same error as for {ok, X} = error.",
+      explanation: "The match raises {badmatch, Reply}, and Common Test reports the case as failed."
+    },
+    {
+      id: "l24_unique_names",
+      question: "Two cases build usernames from erlang:unique_integer/1. Are the integers equal?",
+      code: "A = erlang:unique_integer([positive]).\nB = erlang:unique_integer([positive]).\nA =:= B.\n% => ___",
+      answer: "false",
+      hint: "The name of the function says it.",
+      explanation: "It never returns the same value twice in one VM, so every case gets its own username."
+    },
+    {
+      id: "l24_bounded_retry",
+      question: "The check is true from the third call on, and wait_until gets two attempts. What does it return?",
+      code: "wait_until(_Check, 0) ->\n    gave_up;\nwait_until(Check, Attempts) ->\n    case Check() of\n        true -> ok;\n        false -> wait_until(Check, Attempts - 1)\n    end.\n\nCounter = counters:new(1, []).\nCheck = fun() ->\n    counters:add(Counter, 1, 1),\n    counters:get(Counter, 1) >= 3\nend.\nwait_until(Check, 2).\n% => ___",
+      answer: "gave_up",
+      hint: "counters is an OTP module for mutable integers. The attempts see 1 and 2.",
+      explanation: "Both checks return false. The bound turns a hang into a failed test."
+    }
+  ]}
+/>

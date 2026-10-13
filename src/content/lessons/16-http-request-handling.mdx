@@ -1,0 +1,377 @@
+---
+title: "HTTP Request Handling"
+description: "Parse HTTP/1.1 requests from raw bytes, build responses, and serve the chat page from a small HTTP server"
+postNumber: 16
+publishDate: 2026-09-19T00:00:00Z
+tags: ["intermediate", "networking", "http"]
+difficulty: "intermediate"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+The echo server from lesson 15 speaks a protocol we made up. Browsers speak HTTP, and every WebSocket connection starts life as an HTTP request. Before the chat server can upgrade a connection, it has to read that request and answer it. HTTP/1.1 is plain text over TCP, so we can handle it with the tools we already have.
+
+## What a Request Looks Like
+
+Use the shell as a throwaway server and look at what `curl` sends. From now on we work inside the `erlang_chat` project, so start the shell with `rebar3 shell`.
+
+```erlang
+1> {ok, Listen} = gen_tcp:listen(8080, [binary, {packet, raw}, {active, false}, {reuseaddr, true}]).
+{ok,#Port<0.2>}
+2> {ok, Socket} = gen_tcp:accept(Listen).
+```
+
+The `accept` blocks. Run `curl http://localhost:8080/index.html` in another terminal and the shell continues.
+
+```erlang
+{ok,#Port<0.3>}
+3> {ok, Request} = gen_tcp:recv(Socket, 0).
+{ok,<<"GET /index.html HTTP/1.1\r\nHost: localhost:8080\r\nUser-Agent: curl/8.7.1\r\nAccept: */*\r\n\r\n">>}
+4> gen_tcp:close(Socket), gen_tcp:close(Listen).
+ok
+```
+
+A request has three parts. The **request line** holds the method, the path and the protocol version. Then come the **headers**, one `Name: value` pair per line. Header names are case-insensitive. An **empty line** ends the headers. Every line ends with `\r\n`. A `POST` request carries a body after the empty line. We only need `GET` for now.
+
+## Parsing with decode_packet
+
+We could split the binary on `\r\n` ourselves. We don't have to, because the VM ships an HTTP parser. `erlang:decode_packet/3` takes one packet off the front of a binary and returns the remaining bytes. The type `http_bin` parses a request line.
+
+```erlang
+5> Raw = <<"GET /index.html HTTP/1.1\r\nHost: localhost:8080\r\nX-Request-Id: 42\r\n\r\n">>.
+<<"GET /index.html HTTP/1.1\r\nHost: localhost:8080\r\nX-Request-Id: 42\r\n\r\n">>
+6> {ok, Line, Rest1} = erlang:decode_packet(http_bin, Raw, []).
+{ok,{http_request,'GET',{abs_path,<<"/index.html">>},{1,1}},
+    <<"Host: localhost:8080\r\nX-Request-Id: 42\r\n\r\n">>}
+```
+
+The type `httph_bin` parses one header line at a time. After the last header it returns `http_eoh`, the end of headers.
+
+```erlang
+7> {ok, Header1, Rest2} = erlang:decode_packet(httph_bin, Rest1, []).
+{ok,{http_header,14,'Host',<<"Host">>,<<"localhost:8080">>},
+    <<"X-Request-Id: 42\r\n\r\n">>}
+8> {ok, Header2, Rest3} = erlang:decode_packet(httph_bin, Rest2, []).
+{ok,{http_header,0,<<"X-Request-Id">>,<<"X-Request-Id">>,
+                 <<"42">>},
+    <<"\r\n">>}
+9> erlang:decode_packet(httph_bin, Rest3, []).
+{ok,http_eoh,<<>>}
+10> erlang:decode_packet(http_bin, <<"GET /index.html HTT">>, []).
+{more,undefined}
+```
+
+Two details matter. First, the parser returns well-known header names as atoms (`'Host'`) and all others as binaries (`<<"X-Request-Id">>`). It also fixes their capitalisation. Code that looks up headers should not care about any of that, so we'll convert every name to a lowercase binary. Second, `{more, _}` means the packet is not complete yet. TCP is a byte stream, so a request can arrive in pieces. That is not an error. The caller should read more bytes and try again.
+
+## The chat_http Module
+
+`chat_http` contains only pure functions. They take binaries and return terms, and never touch a socket. That makes them easy to try in the shell and easy to unit test in lesson 23.
+
+**Create `src/chat_http.erl`:**
+
+```erlang
+-module(chat_http).
+-export([parse_request/1, response/3]).
+
+%% Parse one HTTP request from the start of a binary.
+%% Returns {ok, Request, Rest}, more, or {error, bad_request}.
+parse_request(Bin) ->
+    case erlang:decode_packet(http_bin, Bin, []) of
+        {ok, {http_request, Method, {abs_path, Path}, _Version}, Rest} ->
+            parse_headers(Rest, #{method => Method, path => Path}, #{});
+        {ok, _Other, _Rest} ->
+            {error, bad_request};
+        {more, _Length} ->
+            more;
+        {error, _Reason} ->
+            {error, bad_request}
+    end.
+
+parse_headers(Bin, Request, Headers) ->
+    case erlang:decode_packet(httph_bin, Bin, []) of
+        {ok, {http_header, _, Name, _, Value}, Rest} ->
+            parse_headers(Rest, Request, Headers#{header_name(Name) => Value});
+        {ok, http_eoh, Rest} ->
+            {ok, Request#{headers => Headers}, Rest};
+        {ok, _Other, _Rest} ->
+            {error, bad_request};
+        {more, _Length} ->
+            more;
+        {error, _Reason} ->
+            {error, bad_request}
+    end.
+
+header_name(Name) when is_atom(Name) ->
+    header_name(atom_to_binary(Name));
+header_name(Name) when is_binary(Name) ->
+    string:lowercase(Name).
+
+%% Build an HTTP/1.1 response as iodata.
+response(Status, Headers, Body) ->
+    AllHeaders = length_header(Status, Body) ++ Headers,
+    [<<"HTTP/1.1 ">>, integer_to_binary(Status), <<" ">>, reason(Status), <<"\r\n">>,
+     [[Name, <<": ">>, Value, <<"\r\n">>] || {Name, Value} <- AllHeaders],
+     <<"\r\n">>,
+     Body].
+
+%% 1xx and 204 responses have no body, so they carry no Content-Length.
+length_header(Status, _Body) when Status < 200; Status =:= 204 ->
+    [];
+length_header(_Status, Body) ->
+    [{<<"Content-Length">>, integer_to_binary(iolist_size(Body))}].
+
+reason(101) -> <<"Switching Protocols">>;
+reason(200) -> <<"OK">>;
+reason(204) -> <<"No Content">>;
+reason(400) -> <<"Bad Request">>;
+reason(401) -> <<"Unauthorized">>;
+reason(403) -> <<"Forbidden">>;
+reason(404) -> <<"Not Found">>;
+reason(405) -> <<"Method Not Allowed">>;
+reason(426) -> <<"Upgrade Required">>;
+reason(500) -> <<"Internal Server Error">>;
+reason(_) -> <<"Unknown">>.
+```
+
+`parse_request/1` returns a map with the keys `method`, `path` and `headers`. Known methods are atoms such as `'GET'`. The path and all header values are binaries. Anything that is not a request line, such as a response line or garbage, becomes `{error, bad_request}`. `Rest` holds the bytes after the empty line. For a `GET` it is normally empty. Later it will carry the first WebSocket bytes or a request body.
+
+A response mirrors a request. It has a status line, headers, an empty line and the body. `response/3` adds `Content-Length` itself, because the client needs it to know where the body ends. The result is iodata. We never glue the pieces into one binary, and `gen_tcp:send/2` does not need us to.
+
+Compile from inside the shell with `r3:compile()` (or restart `rebar3 shell`) and try it.
+
+```erlang
+11> r3:compile().
+ok
+12> chat_http:parse_request(Raw).
+{ok,#{path => <<"/index.html">>,
+      headers =>
+          #{<<"host">> => <<"localhost:8080">>,
+            <<"x-request-id">> => <<"42">>},
+      method => 'GET'},
+    <<>>}
+13> chat_http:parse_request(<<"GET / HTTP/1.1\r\nHost: loc">>).
+more
+14> chat_http:parse_request(<<"hello there\r\n\r\n">>).
+{error,bad_request}
+15> iolist_to_binary(chat_http:response(200, [{<<"Content-Type">>, <<"text/plain">>}], <<"hi\n">>)).
+<<"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Type: text/plain\r\n\r\nhi\n">>
+```
+
+## Serving a Page
+
+Static files belong in `priv/`. `code:priv_dir(chat_server)` returns that directory for our application, wherever it ends up being installed.
+
+**Create `priv/index.html`:**
+
+```html
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Erlang Chat</title>
+  </head>
+  <body>
+    <h1>Erlang Chat</h1>
+    <p>Served by our own HTTP server. The chat client arrives in lesson 20.</p>
+  </body>
+</html>
+```
+
+The demo server has the same shape as the echo server. The socket uses `{packet, raw}`, so the handler keeps a buffer. It appends whatever `recv` returns until `parse_request/1` stops answering `more`.
+
+**Create `src/http_server.erl`:**
+
+```erlang
+-module(http_server).
+-export([start/0, start/1]).
+
+start() ->
+    start(8080).
+
+start(Port) ->
+    spawn(fun() -> listen(Port) end).
+
+listen(Port) ->
+    Options = [binary, {packet, raw}, {active, false}, {reuseaddr, true}],
+    {ok, ListenSocket} = gen_tcp:listen(Port, Options),
+    io:format("HTTP server listening on port ~p~n", [Port]),
+    accept_loop(ListenSocket).
+
+accept_loop(ListenSocket) ->
+    {ok, Socket} = gen_tcp:accept(ListenSocket),
+    spawn(fun() -> read_request(Socket, <<>>) end),
+    accept_loop(ListenSocket).
+
+read_request(Socket, Buffer) ->
+    case chat_http:parse_request(Buffer) of
+        {ok, Request, _Rest} ->
+            gen_tcp:send(Socket, handle(Request)),
+            gen_tcp:close(Socket);
+        more ->
+            case gen_tcp:recv(Socket, 0, 5000) of
+                {ok, Data} ->
+                    read_request(Socket, <<Buffer/binary, Data/binary>>);
+                {error, _Reason} ->
+                    gen_tcp:close(Socket)
+            end;
+        {error, bad_request} ->
+            gen_tcp:send(Socket, text_response(400, <<"Bad Request\n">>)),
+            gen_tcp:close(Socket)
+    end.
+
+handle(#{method := 'GET', path := <<"/">>}) ->
+    File = filename:join(code:priv_dir(chat_server), "index.html"),
+    {ok, Body} = file:read_file(File),
+    chat_http:response(200, [
+        {<<"Content-Type">>, <<"text/html; charset=utf-8">>},
+        {<<"Connection">>, <<"close">>}
+    ], Body);
+handle(#{method := Method, path := Path}) ->
+    io:format("404 for ~p ~s~n", [Method, Path]),
+    text_response(404, <<"Not Found\n">>).
+
+text_response(Status, Body) ->
+    chat_http:response(Status, [
+        {<<"Content-Type">>, <<"text/plain">>},
+        {<<"Connection">>, <<"close">>}
+    ], Body).
+```
+
+The handlers use passive mode, so they need no ownership transfer. Routing is pattern matching on the request map. HTTP/1.1 connections stay open by default. We close after one response and say so with `Connection: close`. Start the server with `http_server:start().` and test it.
+
+```bash
+$ curl -i http://localhost:8080/
+HTTP/1.1 200 OK
+Content-Length: 232
+Content-Type: text/html; charset=utf-8
+Connection: close
+
+<!DOCTYPE html>
+<html>
+...
+
+$ curl -i http://localhost:8080/nope
+HTTP/1.1 404 Not Found
+Content-Length: 10
+Content-Type: text/plain
+Connection: close
+
+Not Found
+```
+
+Open `http://localhost:8080/` in a browser too. The Erlang shell prints `404 for 'GET' /favicon.ico`, because browsers ask for an icon on their own.
+
+## Exercises
+
+**Exercise 1: Query strings**
+
+`decode_packet` leaves the query string in the path. Add a function that splits it off with `binary:split/2`.
+
+```erlang
+% chat_http:split_path(<<"/ws?room=lobby">>).
+% Expected: {<<"/ws">>, <<"room=lobby">>}
+% chat_http:split_path(<<"/ws">>).
+% Expected: {<<"/ws">>, <<>>}
+```
+
+**Exercise 2: Method not allowed**
+
+Make `http_server` answer any method other than `GET` with status 405 and an `Allow: GET` header.
+
+```bash
+curl -i -X DELETE http://localhost:8080/
+# Expected: HTTP/1.1 405 Method Not Allowed
+```
+
+**Exercise 3: More static files**
+
+Serve `/style.css` from `priv/style.css` with the content type `text/css`. Return 404 when `file:read_file/1` returns `{error, enoent}` instead of crashing the handler.
+
+```erlang
+% handle(#{method := 'GET', path := <<"/style.css">>}) -> ...
+```
+
+**Exercise 4: A slow client**
+
+Send a request in two pieces with `gen_tcp` from a second shell and confirm the server still answers.
+
+```erlang
+% {ok, S} = gen_tcp:connect("localhost", 8080, [binary, {active, false}]).
+% gen_tcp:send(S, <<"GET / HT">>).
+% gen_tcp:send(S, <<"TP/1.1\r\nHost: localhost\r\n\r\n">>).
+% gen_tcp:recv(S, 0).
+% Expected: {ok, <<"HTTP/1.1 200 OK\r\n...">>}
+```
+
+## Key Takeaways
+
+- **HTTP/1.1 is text over TCP**. A request is a request line, headers, and an empty line, all separated by `\r\n`
+- **`erlang:decode_packet/3`** parses request lines with `http_bin` and headers with `httph_bin` until it returns `http_eoh`
+- **Normalise header names** to lowercase binaries, because the parser mixes atoms and binaries and HTTP names are case-insensitive
+- **`more` is not an error**. Keep the bytes in a buffer, read again, and parse again
+- **Responses are iodata**. Status line, headers with `Content-Length`, an empty line, then the body
+- **Pure functions first**. `chat_http` never touches a socket, so it can be tested without a network
+- **`code:priv_dir/1`** finds static files such as `priv/index.html`
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l16_request_path",
+      question: "What path does decode_packet extract from this request line?",
+      code: '{ok, {http_request, _Method, {abs_path, Path}, _Version}, _Rest} =\n    erlang:decode_packet(http_bin, <<"GET /ws HTTP/1.1\\r\\n">>, []).\nPath.\n% => ___',
+      answer: '<<"/ws">>',
+      hint: "http_bin returns strings as binaries.",
+      explanation: "The request line is METHOD PATH VERSION. With http_bin the path comes back as a binary."
+    },
+    {
+      id: "l16_incomplete_line",
+      question: "What does decode_packet return as the first element when the line is not complete?",
+      code: 'erlang:decode_packet(http_bin, <<"GET /ws HT">>, []).\n% => {___, undefined}',
+      answer: "more",
+      hint: "There is no \\r\\n yet, so the parser cannot finish.",
+      explanation: "decode_packet returns {more, Length} when it needs more bytes. parse_request turns that into the atom more."
+    },
+    {
+      id: "l16_end_of_headers",
+      question: "What does httph_bin return for the empty line after the last header?",
+      code: 'erlang:decode_packet(httph_bin, <<"\\r\\n">>, []).\n% => {ok, ___, <<>>}',
+      answer: "http_eoh",
+      hint: "It stands for end of headers.",
+      explanation: "The empty line ends the header block, and decode_packet reports it as http_eoh."
+    },
+    {
+      id: "l16_unknown_header_name",
+      question: "Is the name of a header the parser does not know returned as an atom?",
+      code: '{ok, {http_header, _, Name, _, Value}, _} =\n    erlang:decode_packet(httph_bin, <<"X-Room: lobby\\r\\n\\r\\n">>, []).\n{is_atom(Name), Value}.\n% => {___, <<"lobby">>}',
+      answer: "false",
+      hint: "Only well-known names such as Host become atoms.",
+      explanation: "Unknown header names come back as binaries, which is why chat_http normalises every name."
+    },
+    {
+      id: "l16_normalise_name",
+      question: "What key does chat_http store this header under?",
+      code: "string:lowercase(atom_to_binary('Content-Type')).\n% => ___",
+      answer: '<<"content-type">>',
+      hint: "Atom to binary first, then lowercase.",
+      explanation: "All header names become lowercase binaries, so lookups never depend on how the client spelled them."
+    },
+    {
+      id: "l16_content_length",
+      question: "What Content-Length does response/3 compute for this iodata body?",
+      code: 'iolist_size([<<"echo: ">>, <<"hi\\n">>]).\n% => ___',
+      answer: "9",
+      hint: "Count the bytes, including the space and the newline.",
+      explanation: "iolist_size/1 counts the bytes of iodata without flattening it. 6 bytes plus 3 bytes is 9."
+    },
+    {
+      id: "l16_read_loop_more",
+      question: "Which parse_request result means the handler must read more bytes?",
+      code: 'read_request(Socket, Buffer) ->\n    case chat_http:parse_request(Buffer) of\n        {ok, _Request, _Rest} ->\n            gen_tcp:send(Socket, chat_http:response(200, [], <<"ok">>));\n        ___ ->\n            {ok, Data} = gen_tcp:recv(Socket, 0),\n            read_request(Socket, <<Buffer/binary, Data/binary>>);\n        {error, bad_request} ->\n            gen_tcp:close(Socket)\n    end.',
+      answer: "more",
+      hint: "The request is incomplete, which is normal on a byte stream.",
+      explanation: "parse_request returns more for an incomplete request. The handler appends new data to the buffer and parses again."
+    }
+  ]}
+/>

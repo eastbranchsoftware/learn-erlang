@@ -1,0 +1,355 @@
+---
+title: "WebSocket Frames"
+description: "Decode and encode WebSocket frames with the bit syntax, including payload lengths, opcodes and client masking"
+postNumber: 18
+publishDate: 2026-09-19T00:00:00Z
+tags: ["intermediate", "networking", "websocket"]
+difficulty: "intermediate"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+At the end of lesson 17 the browser sent `"hi"` and our server printed `<<129,130,101,218,35,6,13,179>>`. After the handshake, every WebSocket message travels inside a **frame**, a small binary header followed by the payload. Frames solve the problem from lesson 15. TCP is a byte stream, and the header tells the receiver where each message ends. Erlang's bit syntax can take the header apart field by field.
+
+## The Frame Layout
+
+```text
+ byte 0            byte 1            then
++---+-----+------+ +----+---------+ +-----------------+-------------+---------+
+|FIN| RSV |opcode| |MASK| length  | | extended length | masking key | payload |
+| 1 |  3  |  4   | | 1  |    7    | | 0, 16 or 64     | 0 or 32     |         |
++---+-----+------+ +----+---------+ +-----------------+-------------+---------+
+                              (field sizes in bits)
+```
+
+- **FIN** is 1 on the last frame of a message. Most messages fit in one frame
+- **RSV** holds three reserved bits. They must be 0 unless an extension was negotiated
+- **opcode** says what the frame carries
+- **MASK** is 1 when the payload is masked with the 4-byte key that follows the length
+
+| Opcode | Frame | Purpose |
+| --- | --- | --- |
+| 0 | continuation | next part of a fragmented message |
+| 1 | text | UTF-8 text |
+| 2 | binary | arbitrary bytes |
+| 8 | close | start or confirm the closing handshake |
+| 9 | ping | "are you there?" |
+| 10 | pong | reply to a ping, with the same payload |
+
+The bit syntax from lesson 5 matched whole bytes. A segment such as `Fin:1` matches a number of bits instead. Take the browser's frame apart in `rebar3 shell`.
+
+```erlang
+1> <<Fin:1, Rsv:3, Opcode:4, Mask:1, Len:7, Rest/binary>> = <<129,130,101,218,35,6,13,179>>.
+<<129,130,101,218,35,6,13,179>>
+2> {Fin, Rsv, Opcode, Mask, Len}.
+{1,0,1,1,2}
+3> <<Key:4/binary, Payload:Len/binary>> = Rest.
+<<101,218,35,6,13,179>>
+```
+
+A final text frame, masked, with a 2-byte payload. `Payload:Len/binary` uses the length we just read as the size of the next segment.
+
+## Payload Length
+
+Seven bits count to 127, so longer payloads need more room. The 7-bit field doubles as a marker.
+
+- 0 to 125 is the length itself
+- 126 means the real length follows as a 16-bit integer
+- 127 means the real length follows as a 64-bit integer
+
+## Masking
+
+Frames from a client are always masked, and frames from a server never are. The browser picks a random 4-byte key per frame and XORs payload byte `i` with key byte `i rem 4`. Masking hides nothing, since the key travels in the same frame. It exists so that a web page cannot choose the exact bytes on the wire, a trick that was used to poison the caches of old proxies.
+
+XOR undoes itself, so unmasking is the same operation with the same key.
+
+```erlang
+4> <<(13 bxor 101), (179 bxor 218)>>.
+<<"hi">>
+```
+
+A loop over single bytes works, but it is slow for large payloads. We can XOR 32 bits at a time, because an integer segment can be as wide as the key. The last 1 to 3 bytes need care. They line up with the first bytes of the key, so we shift the key right to drop the bytes we don't need.
+
+**Update `src/chat_ws.erl`:**
+
+```erlang
+%% In src/chat_ws.erl
+%% Add a second export line below the first one.
+-export([decode_frame/1, encode_frame/1, mask/2]).
+
+%% XOR the payload with the 4-byte key, 32 bits at a time.
+%% Masking and unmasking are the same operation.
+mask(Payload, <<Key:32>>) ->
+    mask(Payload, Key, <<>>).
+
+mask(<<Chunk:32, Rest/binary>>, Key, Acc) ->
+    mask(Rest, Key, <<Acc/binary, (Chunk bxor Key):32>>);
+mask(<<Chunk:24>>, Key, Acc) ->
+    <<Acc/binary, (Chunk bxor (Key bsr 8)):24>>;
+mask(<<Chunk:16>>, Key, Acc) ->
+    <<Acc/binary, (Chunk bxor (Key bsr 16)):16>>;
+mask(<<Chunk:8>>, Key, Acc) ->
+    <<Acc/binary, (Chunk bxor (Key bsr 24)):8>>;
+mask(<<>>, _Key, Acc) ->
+    Acc.
+```
+
+Appending to `Acc` in a loop like this is efficient. The runtime extends the binary in place instead of copying it.
+
+## Decoding Frames
+
+`decode_frame/1` follows the pattern of `chat_http:parse_request/1`. It takes a buffer and returns `{ok, Frame, Rest}`, `more` when the frame is incomplete, or `{error, Reason}`. A frame is a tuple such as `{text, <<"hi">>}`.
+
+```erlang
+%% In src/chat_ws.erl
+
+decode_frame(<<Fin:1, Rsv:3, Opcode:4, Mask:1, Len7:7, Rest/binary>>) ->
+    case frame_type(Fin, Rsv, Opcode) of
+        {ok, Type} -> decode_length(Type, Mask, Len7, Rest);
+        {error, Reason} -> {error, Reason}
+    end;
+decode_frame(Bin) when is_binary(Bin) ->
+    more.
+
+frame_type(_Fin, Rsv, _Opcode) when Rsv =/= 0 -> {error, reserved_bits_set};
+frame_type(0, _Rsv, _Opcode) -> {error, fragmentation_not_supported};
+frame_type(1, _Rsv, 0) -> {error, fragmentation_not_supported};
+frame_type(1, _Rsv, 1) -> {ok, text};
+frame_type(1, _Rsv, 2) -> {ok, binary};
+frame_type(1, _Rsv, 8) -> {ok, close};
+frame_type(1, _Rsv, 9) -> {ok, ping};
+frame_type(1, _Rsv, 10) -> {ok, pong};
+frame_type(1, _Rsv, Opcode) -> {error, {unknown_opcode, Opcode}}.
+
+decode_length(Type, Mask, 126, <<Len:16, Rest/binary>>) ->
+    decode_payload(Type, Mask, Len, Rest);
+decode_length(Type, Mask, 127, <<Len:64, Rest/binary>>) ->
+    decode_payload(Type, Mask, Len, Rest);
+decode_length(Type, Mask, Len, Rest) when Len < 126 ->
+    decode_payload(Type, Mask, Len, Rest);
+decode_length(_Type, _Mask, _Len7, _Rest) ->
+    more.
+
+%% Len is bound here, so it can be used as a size inside the patterns.
+decode_payload(Type, Mask, Len, Data) ->
+    case {Mask, Data} of
+        {1, <<Key:4/binary, Payload:Len/binary, Rest/binary>>} ->
+            {ok, {Type, mask(Payload, Key)}, Rest};
+        {0, <<Payload:Len/binary, Rest/binary>>} ->
+            {ok, {Type, Payload}, Rest};
+        _ ->
+            more
+    end.
+```
+
+Each step either matches enough bytes or falls through to `more`. Fewer than 2 bytes, a missing extended length, a partial key or a partial payload all mean "read again". The decoder accepts unmasked frames too, so a test client can use it to read what the server sends.
+
+The RFC gives sample frames for `"Hello"`, one unmasked and one masked.
+
+```erlang
+5> r3:compile().
+ok
+6> chat_ws:decode_frame(<<16#81, 16#05, "Hello">>).
+{ok,{text,<<"Hello">>},<<>>}
+7> chat_ws:decode_frame(<<16#81, 16#85, 16#37, 16#fa, 16#21, 16#3d, 16#7f, 16#9f, 16#4d, 16#51, 16#58>>).
+{ok,{text,<<"Hello">>},<<>>}
+8> chat_ws:decode_frame(<<129,130,101,218,35>>).
+more
+9> chat_ws:decode_frame(<<129,130,101,218,35,6,13,179,137,128,1,2,3,4>>).
+{ok,{text,<<"hi">>},<<137,128,1,2,3,4>>}
+```
+
+Prompt 9 has two frames in one buffer. `Rest` holds the second one, an empty ping, ready for the next call.
+
+## Encoding Frames
+
+Server frames are unmasked, so encoding is short. The header is built with the same bit syntax, and the payload is attached as iodata without copying.
+
+```erlang
+%% In src/chat_ws.erl
+
+encode_frame({Type, Payload}) ->
+    Len = iolist_size(Payload),
+    [<<1:1, 0:3, (opcode(Type)):4, 0:1, (encode_length(Len))/bits>>, Payload].
+
+encode_length(Len) when Len < 126 -> <<Len:7>>;
+encode_length(Len) when Len < 65536 -> <<126:7, Len:16>>;
+encode_length(Len) -> <<127:7, Len:64>>.
+
+opcode(text) -> 1;
+opcode(binary) -> 2;
+opcode(close) -> 8;
+opcode(ping) -> 9;
+opcode(pong) -> 10.
+```
+
+`encode_length/1` returns 7, 23 or 71 bits, which is not a whole number of bytes. The `/bits` type allows such a bitstring inside a larger binary. Together with the 9 bits before it, the header always ends on a byte boundary.
+
+```erlang
+10> iolist_to_binary(chat_ws:encode_frame({text, <<"Hello">>})).
+<<129,5,72,101,108,108,111>>
+```
+
+That is the RFC's unmasked sample.
+
+## Fragmentation
+
+A sender may split one message over several frames. The first has FIN 0 and the real opcode. The following ones have opcode 0, and the last has FIN 1. Browsers rarely fragment messages of chat size, so our decoder reports `{error, fragmentation_not_supported}`. Exercise 1 adds support.
+
+## Echoing Frames
+
+The demo server can now speak WebSocket. `ws_loop` gets a buffer, the same way `read_request/2` has one. It decodes every complete frame in the buffer before it reads from the socket again.
+
+**Update `src/http_server.erl`:**
+
+```erlang
+%% In src/http_server.erl
+%% In route/3, use Rest and call ws_loop(Socket, Rest) after the handshake.
+
+ws_loop(Socket, Buffer) ->
+    case chat_ws:decode_frame(Buffer) of
+        {ok, Frame, Rest} ->
+            io:format("~p: frame ~p~n", [self(), Frame]),
+            case handle_frame(Socket, Frame) of
+                ok -> ws_loop(Socket, Rest);
+                stop -> gen_tcp:close(Socket)
+            end;
+        more ->
+            case gen_tcp:recv(Socket, 0) of
+                {ok, Data} ->
+                    ws_loop(Socket, <<Buffer/binary, Data/binary>>);
+                {error, _Reason} ->
+                    gen_tcp:close(Socket)
+            end;
+        {error, Reason} ->
+            io:format("~p: bad frame ~p~n", [self(), Reason]),
+            gen_tcp:send(Socket, chat_ws:encode_frame({close, <<1002:16>>})),
+            gen_tcp:close(Socket)
+    end.
+
+handle_frame(Socket, {text, Text}) ->
+    gen_tcp:send(Socket, chat_ws:encode_frame({text, [<<"echo: ">>, Text]}));
+handle_frame(Socket, {ping, Payload}) ->
+    gen_tcp:send(Socket, chat_ws:encode_frame({pong, Payload}));
+handle_frame(Socket, {close, Payload}) ->
+    gen_tcp:send(Socket, chat_ws:encode_frame({close, Payload})),
+    stop;
+handle_frame(_Socket, _Frame) ->
+    ok.
+```
+
+A ping must be answered with a pong that carries the same payload. A close frame is answered with a close frame, and then the socket is closed. Its payload starts with a 16-bit status code. 1000 is a normal close and 1002 is a protocol error. Restart the server, open `http://localhost:8080/` and use the console.
+
+```javascript
+const ws = new WebSocket("ws://localhost:8080/ws");
+ws.onmessage = (event) => console.log(event.data);
+ws.send("hi");
+// echo: hi
+ws.close(1000, "done");
+```
+
+The Erlang shell shows the decoded frames.
+
+```text
+<0.193.0>: WebSocket open
+<0.193.0>: frame {text,<<"hi">>}
+<0.193.0>: frame {close,<<3,232,100,111,110,101>>}
+```
+
+The close payload is `<<1000:16, "done">>`. Try `ws.send("x".repeat(70000))` as well. It exercises the 64-bit length in both directions.
+
+## Exercises
+
+**Exercise 1: Fragmented messages**
+
+Write `chat_ws:decode_message/2` on top of a decoder that also returns FIN and continuation frames. It collects fragments until FIN is 1. Control frames may arrive between fragments.
+
+```erlang
+% First = <<16#01, 16#03, "Hel">>, Last = <<16#80, 16#02, "lo">> (RFC sample)
+% Expected: the two frames together decode to {text, <<"Hello">>}
+```
+
+**Exercise 2: Close codes**
+
+Write `close_reason/1`, which splits a close payload into status code and reason text.
+
+```erlang
+% chat_ws:close_reason(<<3,232,"done">>).
+% Expected: {1000, <<"done">>}
+% chat_ws:close_reason(<<>>).
+% Expected: {1005, <<>>}   % 1005 means no status code was present
+```
+
+**Exercise 3: A masked encoder**
+
+A test client has to mask its frames. Write `encode_masked/2`, which takes a frame and a 4-byte key, and check that `decode_frame/1` reverses it.
+
+```erlang
+% Frame = iolist_to_binary(chat_ws:encode_masked({text, <<"Hello">>}, <<16#37, 16#fa, 16#21, 16#3d>>)).
+% Expected: <<129,133,55,250,33,61,127,159,77,81,88>>
+```
+
+## Key Takeaways
+
+- **Frames give the byte stream boundaries**. A header of 2 to 14 bytes says what the payload is and how long it is
+- **The bit syntax matches bits**. `<<Fin:1, Rsv:3, Opcode:4, Mask:1, Len:7, Rest/binary>>` reads the whole fixed header in one pattern
+- **Length markers** 126 and 127 announce a 16-bit or 64-bit length. Values up to 125 are the length itself
+- **Client frames are always masked**, server frames never. Unmasking is XOR with the 4-byte key, and XOR undoes itself
+- **Return `more` for incomplete input** and hand back `Rest`, so the caller can keep a buffer and decode several frames from one read
+- **Control frames** keep the connection healthy. Answer ping with pong and close with close
+- **Encode to iodata**. A small header binary plus the untouched payload avoids copying large messages
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l18_opcode_bits",
+      question: "What opcode does the first byte 16#81 contain?",
+      code: '<<Fin:1, _Rsv:3, Opcode:4, _/binary>> = <<16#81, 16#05, "Hello">>.\n{Fin, Opcode}.\n% => {1, ___}',
+      answer: "1",
+      hint: "16#81 is 1000 0001 in binary. The opcode is the low four bits.",
+      explanation: "The top bit is FIN and the low four bits are the opcode. Opcode 1 is a text frame."
+    },
+    {
+      id: "l18_ping_opcode",
+      question: "Which opcode builds an empty ping frame?",
+      code: "<<1:1, 0:3, ___:4, 0:1, 0:7>>.\n% => <<16#89, 0>>",
+      answer: "9",
+      hint: "Close is 8 and pong is 10.",
+      explanation: "FIN 1 plus opcode 9 gives the byte 16#89. The second byte says unmasked, length 0."
+    },
+    {
+      id: "l18_xor_unmask",
+      question: "Which key byte turns the masked byte back into $h?",
+      code: "Masked = $h bxor 101.\nMasked bxor ___.\n% => $h",
+      answer: "101",
+      hint: "XOR with the same value twice returns the original.",
+      explanation: "Masking and unmasking are the same XOR with the same key byte."
+    },
+    {
+      id: "l18_extended_length",
+      question: "What payload length does this header announce?",
+      code: "<<_:9, Marker:7, Len:16>> = <<16#82, 126, 1, 44>>.\n{Marker, Len}.\n% => {126, ___}",
+      answer: "300",
+      hint: "The two bytes 1 and 44 form a 16-bit integer: 1 * 256 + 44.",
+      explanation: "The marker 126 means the real length follows as a 16-bit integer, here 300."
+    },
+    {
+      id: "l18_close_code",
+      question: "Which status code is in this close payload?",
+      code: '<<Code:16, Reason/binary>> = <<3, 232, "done">>.\n{Code, Reason}.\n% => {___, <<"done">>}',
+      answer: "1000",
+      hint: "3 * 256 + 232.",
+      explanation: "A close payload starts with a 16-bit status code. 1000 means a normal close."
+    },
+    {
+      id: "l18_incomplete_frame",
+      question: "What does this small decoder return when only 3 of the 5 payload bytes have arrived?",
+      code: 'decode(<<_:9, Len:7, Rest/binary>>) when Len < 126 ->\n    case Rest of\n        <<Payload:Len/binary, Tail/binary>> -> {ok, Payload, Tail};\n        _ -> more\n    end;\ndecode(_) ->\n    more.\n\ndecode(<<16#81, 5, "Hel">>).\n% => ___',
+      answer: "more",
+      hint: "Payload:5/binary cannot match three bytes.",
+      explanation: "An incomplete frame is not an error. The caller keeps the bytes in its buffer and tries again after the next read."
+    }
+  ]}
+/>

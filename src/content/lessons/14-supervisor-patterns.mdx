@@ -1,0 +1,290 @@
+---
+title: "Supervisor Patterns"
+description: "Put chat_stats and chat_registry under an OTP supervisor and learn child specs, restart strategies and restart limits"
+postNumber: 14
+publishDate: 2026-09-19T00:00:00Z
+tags: ["intermediate", "otp", "supervisors"]
+difficulty: "intermediate"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+We have two servers, `chat_stats` and `chat_registry`, and so far we start them by hand. If one crashes, it stays down. Lesson 10 solved that with the hand-written `keeper` process. OTP has a behaviour for the same job. A supervisor starts a list of child processes, links to them, and restarts them when they die.
+
+## The Supervisor Module
+
+A supervisor is a callback module with a single callback. `init/1` returns how to supervise and what to start. The `supervisor` behaviour does the rest.
+
+**Create `src/chat_server_sup.erl`:**
+
+```erlang
+-module(chat_server_sup).
+-behaviour(supervisor).
+
+-export([start_link/0]).
+-export([init/1]).
+
+start_link() ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
+
+init([]) ->
+    SupFlags = #{
+        strategy => one_for_one,
+        intensity => 5,
+        period => 10
+    },
+    Children = [
+        #{
+            id => chat_stats,
+            start => {chat_stats, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker
+        },
+        #{
+            id => chat_registry,
+            start => {chat_registry, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker
+        }
+    ],
+    {ok, {SupFlags, Children}}.
+```
+
+There is no loop, no `receive` and no restart logic in this file. It is pure configuration. A supervisor without application code has very few ways to crash, and the process that restarts everything else must be the most reliable one in the system.
+
+## Child Specs
+
+Each child is described by a map.
+
+| Key | Meaning |
+| --- | --- |
+| `id` | A name for the child inside this supervisor |
+| `start` | A `{Module, Function, Args}` tuple. The supervisor calls it to start and to restart the child |
+| `restart` | When to restart. `permanent`, `transient` or `temporary` |
+| `shutdown` | How long the child gets to stop, in milliseconds, before it is killed. `brutal_kill` kills at once. Use `infinity` for children that are supervisors |
+| `type` | `worker` or `supervisor` |
+
+Only `id` and `start` are required. The defaults are `permanent`, 5000 and `worker`. We spell them out once to see them.
+
+The start function must spawn the child, link it to the calling process and return `{ok, Pid}`. `gen_server:start_link` does exactly that, which is why every server we write has a `start_link` function. The link tells the supervisor that a child died. It also takes the children down when the supervisor dies, so no orphans are left behind.
+
+## Restart Types
+
+- **`permanent`** children are always restarted. Use it for servers that must exist as long as the application runs.
+- **`transient`** children are restarted only after an abnormal exit. Exiting with reason `normal` or `shutdown` means the job is done. Use it for tasks that should finish once.
+- **`temporary`** children are never restarted. Use it for processes such as one client connection. Restarting it makes no sense, because its socket is gone.
+
+## Starting the Tree From the Application
+
+In lesson 00, `chat_server_app:start/2` returned a placeholder process. The `application` behaviour expects the pid of the top supervisor there.
+
+**Update `src/chat_server_app.erl`:**
+
+```erlang
+-module(chat_server_app).
+-behaviour(application).
+
+-export([start/2, stop/1]).
+
+start(_StartType, _StartArgs) ->
+    chat_server_sup:start_link().
+
+stop(_State) ->
+    ok.
+```
+
+`rebar3 shell` starts the `chat_server` application, which now starts the supervisor, which starts both servers in list order.
+
+## Watching a Restart
+
+```erlang
+$ rebar3 shell
+===> Booted chat_server
+1> supervisor:which_children(chat_server_sup).
+[{chat_registry,<0.184.0>,worker,[chat_registry]},
+ {chat_stats,<0.183.0>,worker,[chat_stats]}]
+2> chat_stats:increment(messages).
+ok
+3> chat_registry:register_user(<<"alice">>, self()).
+ok
+```
+
+`which_children/1` lists each child as id, pid, type and modules. Now kill the registry. `kill` cannot be trapped, so this simulates the worst kind of crash.
+
+```erlang
+4> exit(whereis(chat_registry), kill).
+true
+=SUPERVISOR REPORT==== 19-Sep-2026::10:12:37.531241 ===
+    supervisor: {local,chat_server_sup}
+    errorContext: child_terminated
+    reason: killed
+    offender: [{pid,<0.184.0>},
+               {id,chat_registry},
+               ...
+
+5> whereis(chat_registry).
+<0.192.0>
+6> chat_registry:list_users().
+[]
+7> chat_stats:get(messages).
+1
+```
+
+The supervisor logged the death and started a new registry with a new pid under the same registered name, so callers that use the name never notice. With `one_for_one`, `chat_stats` was not touched and still has its counter.
+
+## State Is Lost on Restart
+
+The new registry called `init/1` and started with an empty map. Alice is gone. A restart does not resume the old process. It starts a fresh one in a known good state.
+
+That is the point. A crash usually means the process met a situation its code did not handle, and the state may be part of the problem. Carrying corrupt state into the new process would make it crash again.
+
+Whether the loss is acceptable depends on the data. Counters in `chat_stats` are informational. The registry can be rebuilt, because every entry describes a live connection process that can register again. Data that must survive, such as user accounts, belongs outside the process. Lesson 28 adds a database.
+
+## Strategies
+
+The `strategy` flag decides what else restarts when one child dies.
+
+- **`one_for_one`** restarts only the dead child. Use it when children are independent, as ours are.
+- **`one_for_all`** stops every other child and restarts them all. Use it when children cannot work without each other.
+- **`rest_for_one`** restarts the dead child and every child listed after it. Use it when later children depend on earlier ones, but not the reverse. Children start in list order and stop in reverse order, so put dependencies first.
+
+A fourth strategy, `simple_one_for_one`, handles many identical children that are started on demand. Lesson 19 uses it for client connections.
+
+## Restart Intensity
+
+Restarting fixes rare failures. It cannot fix a child that crashes every time it starts, for example because a port is already in use. Restarting it forever would burn CPU and fill the logs.
+
+`intensity` and `period` set a limit. Ours allow at most 5 restarts within 10 seconds. One more and the supervisor gives up. It stops all its children and exits with reason `shutdown`. A parent supervisor then sees a dead child and applies its own strategy, so the problem moves up the tree until a restart at some level fixes it.
+
+```erlang
+1> Kill = fun() -> exit(whereis(chat_registry), kill), timer:sleep(100) end.
+#Fun<erl_eval.43.113135111>
+2> [Kill() || _ <- lists:seq(1, 6)].
+=SUPERVISOR REPORT==== 19-Sep-2026::10:18:00.962740 ===
+    supervisor: {local,chat_server_sup}
+    errorContext: shutdown
+    reason: reached_max_restart_intensity
+    ...
+=INFO REPORT==== 19-Sep-2026::10:18:00.965677 ===
+    application: chat_server
+    exited: shutdown
+    type: temporary
+
+[ok,ok,ok,ok,ok,ok]
+3> whereis(chat_server_sup).
+undefined
+4> whereis(chat_stats).
+undefined
+```
+
+The transcript leaves out the six `child_terminated` reports. `chat_server_sup` is the top of our tree, so when it gave up, the whole application stopped and `chat_stats` went down with it. `application:start(chat_server)` brings it back. In a release (lesson 25) the node itself shuts down at this point, so that an outside service manager can restart it.
+
+## Compared With keeper From Lesson 10
+
+`keeper` trapped exits, spawned a linked worker and spawned it again when an `'EXIT'` message arrived. A supervisor works the same way inside and adds what we left out.
+
+- A restart limit, so a broken child cannot spin forever
+- Several children with a defined start order and reverse stop order
+- Strategies for children that depend on each other
+- Ordered shutdown. Each child gets `exit(Pid, shutdown)` and up to its `shutdown` time before it is killed
+- Log reports and introspection with `which_children/1`
+
+One detail about shutdown. A gen_server's `terminate/2` runs on a supervisor shutdown only if the server called `process_flag(trap_exit, true)` in `init/1`. `chat_stats` does not, so it dies silently.
+
+## Exercises
+
+**Exercise 1: See the Other Strategies**
+
+Change `strategy` to `one_for_all`, restart `rebar3 shell`, kill `chat_registry` and compare pids. Repeat with `rest_for_one`, killing first `chat_stats` and then `chat_registry`. Set it back to `one_for_one` afterwards.
+
+```erlang
+% Expected with rest_for_one:
+% killing chat_stats     => both pids change
+% killing chat_registry  => only the chat_registry pid changes
+```
+
+**Exercise 2: A Transient Worker**
+
+Write `chat_greeter`, a gen_server that prints a banner in `init/1` and sends itself a message that makes it stop with reason `normal`. Add it to the supervisor as a `transient` child and check that it is not restarted. Then make it stop with reason `oops` and watch what the restart limit does.
+
+```erlang
+% Expected with reason normal:
+% supervisor:which_children(chat_server_sup) shows
+% {chat_greeter,undefined,worker,[chat_greeter]}
+```
+
+**Exercise 3: Terminate on Shutdown**
+
+Add `process_flag(trap_exit, true)` to `chat_stats:init/1`. Run `application:stop(chat_server)` in the shell and confirm that the `terminate/2` message from lesson 12 appears with reason `shutdown`.
+
+```erlang
+% Expected output:
+% chat_stats stopping (shutdown) with #{}
+```
+
+## Key Takeaways
+
+- **A supervisor is configuration.** `init/1` returns supervisor flags and child specs
+- **Child specs** are maps. `id` and `start` are required, and `start` must name a function that links and returns `{ok, Pid}`
+- **`permanent`, `transient`, `temporary`** mean restart always, restart after abnormal exits, and never restart
+- **`one_for_one`, `one_for_all`, `rest_for_one`** decide which siblings restart with a dead child
+- **`intensity` and `period`** cap the restart rate. Past the limit the supervisor stops its children and exits
+- **A restarted process starts from `init/1`.** State is lost on purpose. Keep durable data outside the process
+- **The application's `start/2`** returns the top supervisor, so starting the application starts the whole tree
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l14_independent_strategy",
+      question: "Which strategy restarts only the child that died?",
+      code: "init([]) ->\n    SupFlags = #{strategy => ___, intensity => 5, period => 10},\n    Children = [\n        #{id => chat_stats, start => {chat_stats, start_link, []}},\n        #{id => chat_registry, start => {chat_registry, start_link, []}}\n    ],\n    {ok, {SupFlags, Children}}.",
+      answer: "one_for_one",
+      hint: "One dies, one restarts.",
+      explanation: "chat_stats and chat_registry do not depend on each other, so a crash in one should not restart the other."
+    },
+    {
+      id: "l14_child_spec_start_key",
+      question: "Which child spec key holds the module, function and arguments used to start the child?",
+      code: "init([]) ->\n    Child = #{\n        id => chat_registry,\n        ___ => {chat_registry, start_link, []},\n        restart => permanent\n    },\n    {ok, {#{strategy => one_for_one}, [Child]}}.",
+      answer: "start",
+      hint: "Only two keys are required. The other one is id.",
+      explanation: "The supervisor calls the start tuple with apply/3 both for the first start and for every restart."
+    },
+    {
+      id: "l14_temporary_not_restarted",
+      question: "How many active children remain after a temporary child is killed?",
+      code: "start_worker() ->\n    {ok, spawn_link(fun() -> receive stop -> ok end end)}.\n\ninit([]) ->\n    Child = #{id => conn, start => {?MODULE, start_worker, []}, restart => temporary},\n    {ok, {#{strategy => one_for_one}, [Child]}}.\n\n{ok, Sup} = supervisor:start_link(?MODULE, []).\n[{conn, Pid, _, _}] = supervisor:which_children(Sup).\nexit(Pid, kill).\ntimer:sleep(100).\nproplists:get_value(active, supervisor:count_children(Sup)).\n% => ___",
+      answer: "0",
+      hint: "Temporary children are never restarted.",
+      explanation: "The supervisor removes a temporary child when it dies, whatever the exit reason."
+    },
+    {
+      id: "l14_transient_restart_type",
+      question: "Which restart type restarts the child after a kill but not after a normal exit?",
+      code: "start_worker() ->\n    {ok, spawn_link(fun() -> receive stop -> ok end end)}.\n\ninit([]) ->\n    Child = #{id => job, start => {?MODULE, start_worker, []}, restart => ___},\n    {ok, {#{strategy => one_for_one}, [Child]}}.\n\nActive = fun(S) -> proplists:get_value(active, supervisor:count_children(S)) end.\n{ok, Sup} = supervisor:start_link(?MODULE, []).\n[{job, First, _, _}] = supervisor:which_children(Sup).\nexit(First, kill).\ntimer:sleep(100).\nActive(Sup).\n% => 1\n[{job, Second, _, _}] = supervisor:which_children(Sup).\nSecond ! stop.\ntimer:sleep(100).\nActive(Sup).\n% => 0",
+      answer: "transient",
+      hint: "permanent would restart both times and temporary neither time.",
+      explanation: "A transient child is restarted only when it exits abnormally. Returning from its function is a normal exit, so the supervisor leaves it stopped."
+    },
+    {
+      id: "l14_rest_for_one_siblings",
+      question: "Children a, b and c run under rest_for_one and b is killed. Does c keep its pid?",
+      code: "start_worker() ->\n    {ok, spawn_link(fun() -> receive stop -> ok end end)}.\n\ninit([]) ->\n    Children = [#{id => Id, start => {?MODULE, start_worker, []}} || Id <- [a, b, c]],\n    {ok, {#{strategy => rest_for_one}, Children}}.\n\nPidOf = fun(S, Id) ->\n    {Id, Pid, _, _} = lists:keyfind(Id, 1, supervisor:which_children(S)),\n    Pid\nend.\n{ok, Sup} = supervisor:start_link(?MODULE, []).\n{A1, B1, C1} = {PidOf(Sup, a), PidOf(Sup, b), PidOf(Sup, c)}.\nexit(B1, kill).\ntimer:sleep(100).\n{A1 =:= PidOf(Sup, a), C1 =:= PidOf(Sup, c)}.\n% => {true, ___}",
+      answer: "false",
+      hint: "rest_for_one restarts the dead child and every child started after it.",
+      explanation: "a was started before b and is left alone. c was started after b, so it is restarted with a new pid."
+    },
+    {
+      id: "l14_max_restart_intensity",
+      question: "With which reason does the supervisor exit when the restart limit is exceeded?",
+      code: "start_worker() ->\n    {ok, spawn_link(fun() -> receive stop -> ok end end)}.\n\ninit([]) ->\n    Child = #{id => worker, start => {?MODULE, start_worker, []}},\n    {ok, {#{strategy => one_for_one, intensity => 1, period => 5}, [Child]}}.\n\nKill = fun(S) ->\n    [{worker, Pid, _, _}] = supervisor:which_children(S),\n    exit(Pid, kill),\n    timer:sleep(100)\nend.\nprocess_flag(trap_exit, true).\n{ok, Sup} = supervisor:start_link(?MODULE, []).\nKill(Sup).\nKill(Sup).\nreceive {'EXIT', Sup, Reason} -> Reason after 1000 -> timeout end.\n% => ___",
+      answer: "shutdown",
+      hint: "One restart in five seconds is allowed. The second kill is one too many.",
+      explanation: "A supervisor that exceeds its restart intensity stops its children and exits with reason shutdown."
+    }
+  ]}
+/>

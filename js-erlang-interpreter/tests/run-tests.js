@@ -19,6 +19,10 @@ async function runAllTests() {
     console.log('\nRunning Koan Validation Tests...');
     await import('./koan-validation.test.js');
     
+    // Import koan tests for every lesson, parsed from the .mdx files (executes on import)
+    console.log('\nRunning Lesson Koan Tests (all lessons)...');
+    await import('./lesson-koans.test.js');
+    
     console.log('\n✅ All test suites completed successfully!');
     
   } catch (error) {

@@ -1,0 +1,375 @@
+---
+title: "Production Deployment"
+description: "Package the chat server as an OTP release with rebar3, configure it per environment, and run it on a server without an Erlang install"
+postNumber: 25
+publishDate: 2026-09-19T00:00:00Z
+tags: ["advanced", "deployment", "releases"]
+difficulty: "advanced"
+---
+
+import ErlangKoans from '../../components/ErlangKoans.astro';
+
+Every lesson so far started the chat server with `rebar3 shell`. That command needs the source tree and an Erlang install. It is a development tool. Production runs a release, a term from lesson 11.
+
+## What a Release Is
+
+A release is a directory that holds everything the system needs to run. It contains the Erlang runtime system (ERTS), your application, the OTP applications it depends on, the configuration and a start script. You copy that directory to a server, run the script, and the chat server boots. The server needs no Erlang, no rebar3 and no source code. A boot script starts each packaged application in dependency order.
+
+## The applications List Decides What Ships
+
+The release tool reads `src/chat_server.app.src` to find out what to package. Since lesson 17 it lists `crypto`.
+
+```erlang
+{applications, [kernel, stdlib, crypto]},
+```
+
+The release includes and starts exactly these applications, plus whatever they depend on. This matters more than it did in development. `rebar3 shell` runs on the full Erlang install, so `crypto:strong_rand_bytes/1` works even if `crypto` is missing from the list. In a release the `crypto` directory is not there at all. We removed it, built a release and registered a user.
+
+```text
+=SUPERVISOR REPORT====
+    supervisor: {local,chat_server_sup}
+    errorContext: child_terminated
+    reason: {undef,[{crypto,strong_rand_bytes,[16],[]},
+                    {chat_auth,handle_call,3, ...
+```
+
+`undef` on a module you know exists means the application is missing from the list. Every OTP application you call belongs there.
+
+## Application Environment
+
+The port is a literal `8080` in the `chat_listener` child spec. A deployment needs to change it without a recompile. Every application has an environment, a key-value store that is filled at boot. The defaults live in the `env` entry of the app file.
+
+**Update `src/chat_server.app.src`:**
+
+```erlang
+{application, chat_server,
+ [{description, "WebSocket Chat Server"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications, [kernel, stdlib, crypto]},
+  {mod, {chat_server_app, []}},
+  {env, [{port, 8080}]}
+ ]}.
+```
+
+**Update `src/chat_server_sup.erl`:**
+
+```erlang
+%% In src/chat_server_sup.erl
+init([]) ->
+    Port = application:get_env(chat_server, port, 8080),
+    SupFlags = #{strategy => one_for_one, intensity => 5, period => 10},
+    Children = [
+        %% ... the other children stay the same ...
+        #{id => chat_listener, start => {chat_listener, start_link, [Port]}}
+    ],
+    {ok, {SupFlags, Children}}.
+```
+
+`application:get_env/3` returns the value, or the third argument when the key is not set. `application:get_env/2` returns `{ok, Value}` or `undefined`.
+
+## sys.config and vm.args
+
+Two files configure a node. `sys.config` is one Erlang term, a list of `{App, [{Key, Value}]}` tuples. Its values override the `env` defaults of each application at boot.
+
+**Create `config/sys.config`:**
+
+```erlang
+[
+ {chat_server, [
+   {port, 8080}
+ ]}
+].
+```
+
+`vm.args` holds command line flags for the virtual machine, one per line.
+
+**Create `config/vm.args`:**
+
+```text
+-sname chat_server@localhost
+-setcookie change_me_in_production
++P 2000000
+```
+
+`-sname` gives the node a name. The release script finds the running node by this name. Use `-name` with a full host name when other machines must reach the node (lesson 29). We pin the host part to `localhost`. With a bare `-sname chat_server` the control commands must resolve the machine's short host name, and on many laptops they cannot. The symptom is `Node is not running!` from a node that runs fine.
+
+`-setcookie` sets the shared secret for node connections. Anyone with the cookie can run any code on the node, so generate a long random one for real deployments. `+P` raises the process limit. The default is 1,048,576 and every connection is a process, so this line only matters for very large servers. Older guides add `+K true`, which no longer exists, and `-heart`, whose job a service manager such as systemd now does.
+
+## Configuring relx
+
+rebar3 builds releases with a tool called relx, configured in `rebar.config`.
+
+**Update `rebar.config`:**
+
+```erlang
+{erl_opts, [debug_info]}.
+
+{deps, []}.
+
+{shell, [
+    {apps, [chat_server]},
+    {config, "config/sys.config"}
+]}.
+
+{relx, [
+    {release, {chat_server, "0.1.0"}, [chat_server, sasl]},
+    {dev_mode, true},
+    {include_erts, false},
+    {sys_config, "config/sys.config"},
+    {vm_args, "config/vm.args"}
+]}.
+
+{profiles, [
+    {prod, [
+        {relx, [
+            {dev_mode, false},
+            {include_erts, true}
+        ]}
+    ]}
+]}.
+```
+
+The `release` tuple names the release, gives it a version and lists the top-level applications. relx follows each `applications` list from there. `sasl` adds the release handling tools that the start script expects. `dev_mode` builds the release out of symlinks into `_build`, so a recompile is visible without a rebuild. `include_erts` copies the runtime into the release. The `prod` profile turns symlinks off and the runtime on. The `config` line makes `rebar3 shell` read the same `sys.config`.
+
+## Building the Release
+
+```bash
+$ rebar3 as prod release
+===> Compiling chat_server
+===> Assembling release chat_server-0.1.0...
+===> Release successfully assembled: _build/prod/rel/chat_server
+$ ls _build/prod/rel/chat_server
+bin  erts-16.0.1  lib  releases
+$ ls _build/prod/rel/chat_server/lib
+chat_server-0.1.0  crypto-5.6  kernel-10.3.1  sasl-4.3  stdlib-7.0.1
+$ ls _build/prod/rel/chat_server/releases/0.1.0
+chat_server.rel  start.boot  start.script  sys.config  vm.args  ...
+```
+
+`bin` holds the start script, `erts-16.0.1` is the runtime, `lib` has one directory per application, and `releases/0.1.0` has the boot script and the two config files. The whole directory is 27 MB. `priv/index.html` travels inside `lib/chat_server-0.1.0/priv`, which is why lesson 16 used `code:priv_dir/1` and not a relative path.
+
+## Running It
+
+```bash
+$ cd _build/prod/rel/chat_server
+$ bin/chat_server foreground
+Exec: .../erts-16.0.1/bin/erlexec -noinput +Bd -boot .../releases/0.1.0/start
+      -mode embedded -config .../releases/0.1.0/sys.config
+      -args_file .../releases/0.1.0/vm.args -- foreground
+Chat server listening on port 8080
+```
+
+`foreground` keeps the node attached to the terminal with output on stdout and no shell. Service managers and containers want exactly this. From a second terminal, other commands talk to the running node.
+
+```bash
+$ bin/chat_server ping
+pong
+$ bin/chat_server pid
+37346
+$ bin/chat_server eval 'chat_rooms:list_rooms().'
+[]
+$ bin/chat_server stop
+```
+
+`bin/chat_server daemon` starts the node in the background and writes its output to `log/erlang.log.1` inside the release directory. Run the script with no arguments to see every command.
+
+## The Remote Console
+
+`remote_console` starts a second, temporary node and connects its shell to the running one. Every expression runs inside the live server.
+
+```erlang
+$ bin/chat_server remote_console
+Erlang/OTP 28 [erts-16.0.1] [source] [64-bit] [smp:8:8]
+
+(chat_server@localhost)1> chat_rooms:ensure_room(<<"lobby">>).
+{ok,<0.345.0>}
+(chat_server@localhost)2> chat_rooms:list_rooms().
+[<<"lobby">>]
+(chat_server@localhost)3> application:get_env(chat_server, port).
+{ok,8080}
+(chat_server@localhost)4> erlang:system_info(process_limit).
+2097152
+```
+
+The prompt shows the name of the node you are on. Leave with Ctrl+G and then `q`, or press Ctrl+C twice. Never type `q().` here. It runs on the server and shuts the server down.
+
+## Environment Variables in Config
+
+relx can fill in OS environment variables when the node starts. Name the templates `sys.config.src` and `vm.args.src` and point the `prod` profile at them with `sys_config_src` and `vm_args_src`.
+
+```erlang
+%% config/sys.config.src
+[
+ {chat_server, [
+   {port, ${PORT:-8080}}
+ ]}
+].
+```
+
+```erlang
+%% In rebar.config, inside the prod profile
+{relx, [
+    {sys_config_src, "config/sys.config.src"},
+    {vm_args_src, "config/vm.args.src"},
+    {dev_mode, false},
+    {include_erts, true}
+]}
+```
+
+`config/vm.args.src` is a copy of `vm.args` with `-setcookie ${COOKIE}`. The start script writes the final `sys.config` and `vm.args` next to the templates on every run.
+
+```bash
+$ PORT=9000 COOKIE=s3cret bin/chat_server daemon
+$ cat releases/0.1.0/sys.config
+[
+ {chat_server, [
+   {port, 9000}
+ ]}
+].
+```
+
+`${PORT:-8080}` falls back to 8080 when `PORT` is not set. Older guides tell you to export `RELX_REPLACE_OS_VARS=true`. With rebar3 3.25 the `.src` suffix alone is enough. There is one trap. The control commands render the templates again, so `ping`, `stop` and `remote_console` need the same variables in their environment. Without `COOKIE` they report `Node is not running!`. `rebar3 shell` cannot read a template, so keep the plain `config/sys.config` for development.
+
+## Shipping It
+
+```bash
+$ rebar3 as prod tar
+===> Tarball successfully created: _build/prod/rel/chat_server/chat_server-0.1.0.tar.gz
+$ scp _build/prod/rel/chat_server/chat_server-0.1.0.tar.gz deploy@chat.example.com:/tmp/
+$ ssh deploy@chat.example.com
+$ sudo mkdir -p /opt/chat_server
+$ sudo tar -xzf /tmp/chat_server-0.1.0.tar.gz -C /opt/chat_server
+$ /opt/chat_server/bin/chat_server daemon
+$ /opt/chat_server/bin/chat_server ping
+pong
+```
+
+The tarball is 12 MB. ERTS is a native binary, so build on the same operating system and CPU architecture as the server. A release built on a Mac does not start on Linux. Build on a matching machine or in a container (lesson 36).
+
+systemd keeps the node running after a crash or reboot.
+
+```text
+[Unit]
+Description=Erlang chat server
+After=network.target
+
+[Service]
+User=chat
+Environment=HOME=/opt/chat_server
+Environment=PORT=8080
+ExecStart=/opt/chat_server/bin/chat_server foreground
+ExecStop=/opt/chat_server/bin/chat_server stop
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Save it as `/etc/systemd/system/chat_server.service`, then run `systemctl enable --now chat_server`. systemd wants a process that stays attached and collects its stdout in the journal, so `foreground` fits. `LimitNOFILE` raises the open file limit, because every connection uses one file descriptor.
+
+## Exercises
+
+**Exercise 1: A Configurable Welcome Room**
+
+Every user joins `<<"lobby">>` after login. Read the room name from the application environment.
+
+```erlang
+%% In src/chat_connection.erl
+default_room() ->
+    % Read default_room from the chat_server environment.
+    % Fall back to <<"lobby">>.
+    ok.
+
+% Add {default_room, <<"general">>} to config/sys.config, rebuild, then:
+% $ bin/chat_server eval 'chat_rooms:list_rooms().'
+% Expected after one login: [<<"general">>]
+```
+
+**Exercise 2: Break It on Purpose**
+
+Remove `crypto` from `applications`, run `rebar3 as prod release`, start the node with `daemon` and register a user from the browser.
+
+```erlang
+% Expected in log/erlang.log.1: a SUPERVISOR REPORT for chat_auth
+%   with reason {undef,[{crypto,strong_rand_bytes,[16],[]}, ...
+% Expected: ls lib shows no crypto directory
+% Put crypto back and confirm that registration works again.
+```
+
+**Exercise 3: Two Nodes From One Tarball**
+
+Use `sys.config.src` and `vm.args.src` with `${PORT}` and `${NODE_NAME}`. Unpack the tarball into two directories and start both nodes on one machine.
+
+```erlang
+% $ PORT=8080 NODE_NAME=chat_a@localhost COOKIE=abc bin/chat_server daemon
+% $ PORT=8081 NODE_NAME=chat_b@localhost COOKIE=abc bin/chat_server daemon
+% Expected: both answer pong when ping gets the same variables
+% Expected: http://localhost:8080 and http://localhost:8081 both serve the client
+```
+
+## Key Takeaways
+
+- **A release is self-contained**. It bundles ERTS, your application, its OTP dependencies, config and a start script, so the server needs no Erlang install
+- **The `applications` list is the packing list**. An OTP application that is missing there works in `rebar3 shell` and fails with `undef` in a release
+- **Application environment** holds settings. Defaults go in `env` in the app file, `sys.config` overrides them per deployment, and `application:get_env/3` reads them with a fallback
+- **`vm.args` configures the VM**. The node name and cookie there are what `ping`, `stop` and `remote_console` use to find the node
+- **Profiles separate dev and prod**. `rebar3 as prod release` builds real copies with ERTS included, and `rebar3 as prod tar` makes the archive you ship
+- **`foreground` is for service managers**, `daemon` runs in the background, and `remote_console` gives you a shell inside the live node
+- **ERTS is platform specific**. Build on the same OS and architecture you deploy to
+
+## Interactive Koans
+
+<ErlangKoans
+  koans={[
+    {
+      id: "l25_get_env_default",
+      question: "No config sets this key. What does get_env/3 return?",
+      code: "application:get_env(chat_server, port, 8080).\n% => ___",
+      answer: "8080",
+      hint: "The third argument is the fallback.",
+      explanation: "get_env/3 returns the default when the key is not in the application environment."
+    },
+    {
+      id: "l25_get_env_undefined",
+      question: "What does get_env/2 return for a key that was never set?",
+      code: "application:get_env(chat_server, max_rooms).\n% => ___",
+      answer: "undefined",
+      hint: "The two-argument version has no default to fall back on.",
+      explanation: "get_env/2 returns {ok, Value} when the key exists and the atom undefined when it does not."
+    },
+    {
+      id: "l25_set_env_wins",
+      question: "sys.config sets values the same way set_env does. What does the lookup return now?",
+      code: "application:set_env(chat_server, acceptors, 20).\napplication:get_env(chat_server, acceptors, 10).\n% => ___",
+      answer: "20",
+      hint: "The default is only used when the key is missing.",
+      explanation: "A configured value always wins over the default passed to get_env/3."
+    },
+    {
+      id: "l25_applications_crypto",
+      question: "chat_auth hashes passwords. Which OTP application must be listed so the release includes it?",
+      code: "{application, chat_server,\n [{vsn, \"0.1.0\"},\n  {applications, [kernel, stdlib, ___]},\n  {mod, {chat_server_app, []}},\n  {env, [{port, 8080}]}]}.",
+      answer: "crypto",
+      hint: "Which module does chat_auth call for pbkdf2_hmac?",
+      explanation: "A release packages only the listed applications. Without crypto the node fails with undef on the first registration."
+    },
+    {
+      id: "l25_sys_config_lookup",
+      question: "sys.config is a list of {App, Settings} tuples. What does the last lookup return?",
+      code: "Config = [{chat_server, [{port, 9000}]}, {kernel, [{logger_level, info}]}].\nEnv = proplists:get_value(chat_server, Config).\nproplists:get_value(port, Env).\n% => ___",
+      answer: "9000",
+      hint: "The first lookup returns the chat_server settings list.",
+      explanation: "Each application's settings are a proplist, and at boot they are copied into that application's environment."
+    },
+    {
+      id: "l25_prod_profile",
+      question: "Which profile name makes this config apply to 'rebar3 as prod tar'?",
+      code: "{profiles, [\n    {___, [\n        {relx, [{dev_mode, false}, {include_erts, true}]}\n    ]}\n]}.",
+      answer: "prod",
+      hint: "The name after 'as' on the command line selects the profile.",
+      explanation: "rebar3 as prod merges the prod profile over the top-level config, so the release gets real copies and its own ERTS."
+    }
+  ]}
+/>
