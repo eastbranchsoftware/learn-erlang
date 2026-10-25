@@ -12,18 +12,24 @@
     "astro": "astro"
   },
   "dependencies": {
-    "@astrojs/check": "^0.9.0",
-    "@astrojs/mdx": "^4.0.0",
-    "@astrojs/node": "^9.3.0",
-    "@astrojs/rss": "^4.0.0",
-    "@astrojs/sitemap": "^3.0.0",
-    "@astrojs/tailwind": "^6.0.0",
-    "@tailwindcss/typography": "^0.5.0",
-    "astro": "^5.0.0",
-    "astro-expressive-code": "^0.41.3",
-    "resend": "^4.6.0",
-    "sharp": "^0.33.0",
-    "tailwindcss": "^3.0.0",
-    "typescript": "^5.0.0"
+    "@astrojs/check": "^0.9.12",
+    "@astrojs/mdx": "^8.0.3",
+    "@astrojs/node": "^11.1.9",
+    "@astrojs/rss": "^4.0.19",
+    "@astrojs/sitemap": "^3.7.4",
+    "@tailwindcss/typography": "^0.5.20",
+    "astro": "^7.3.8",
+    "astro-expressive-code": "^0.44.3",
+    "autoprefixer": "^10.4.21",
+    "resend": "^4.8.0",
+    "sharp": "^0.35.5",
+    "tailwindcss": "^3.4.19",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "overrides": {
+    "postcss-selector-parser": "^7.1.6"
   }
 }

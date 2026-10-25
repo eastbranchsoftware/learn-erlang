@@ -4,7 +4,7 @@ export async function GET() {
   const lessons = await getCollection('lessons');
   
   const lessonsData = lessons.map(lesson => ({
-    slug: lesson.slug,
+    slug: lesson.id,
     title: lesson.data.title,
     description: lesson.data.description,
     postNumber: lesson.data.postNumber,
