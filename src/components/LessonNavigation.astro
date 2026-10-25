@@ -11,7 +11,7 @@ const { prev, next } = Astro.props;
   <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
     {prev && (
       <a
-        href={`/lessons/${prev.slug}`}
+        href={`/lessons/${prev.id}`}
         class="group flex items-center space-x-3 p-4 rounded-lg border border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600 transition-colors"
         data-prev-link
       >
@@ -27,7 +27,7 @@ const { prev, next } = Astro.props;
     
     {next && (
       <a
-        href={`/lessons/${next.slug}`}
+        href={`/lessons/${next.id}`}
         class="group flex items-center justify-end space-x-3 p-4 rounded-lg border border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600 transition-colors md:col-start-2"
         data-next-link
       >

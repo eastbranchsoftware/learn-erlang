@@ -1,5 +1,4 @@
 import { defineConfig } from "astro/config";
-import tailwind from "@astrojs/tailwind";
 import mdx from "@astrojs/mdx";
 import sitemap from "@astrojs/sitemap";
 import expressiveCode from "astro-expressive-code";
@@ -9,6 +8,7 @@ import node from "@astrojs/node";
 export default defineConfig({
   site: "https://learnerlang.com",
   output: "server",
+  compressHTML: true,
   adapter: node({
     mode: "standalone",
   }),
@@ -25,7 +25,6 @@ export default defineConfig({
     }),
     mdx(),
 
-    tailwind(),
     sitemap(),
   ],
   markdown: {

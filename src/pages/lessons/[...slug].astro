@@ -1,5 +1,5 @@
 ---
-import { getCollection } from 'astro:content';
+import { getCollection, render } from 'astro:content';
 import LessonLayout from '../../layouts/LessonLayout.astro';
 
 export const prerender = true;
@@ -7,15 +7,15 @@ export const prerender = true;
 export async function getStaticPaths() {
   const lessons = await getCollection('lessons');
   return lessons.map((lesson) => ({
-    params: { slug: lesson.slug },
+    params: { slug: lesson.id },
     props: lesson,
   }));
 }
 
 const lesson = Astro.props;
-const { Content } = await lesson.render();
+const { Content } = await render(lesson);
 ---
 
-<LessonLayout {...lesson.data} slug={lesson.slug}>
+<LessonLayout {...lesson.data} slug={lesson.id}>
   <Content />
 </LessonLayout>

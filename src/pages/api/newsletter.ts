@@ -3,7 +3,7 @@ import { Resend } from 'resend';
 
 export const prerender = false;
 
-const resend = new Resend(import.meta.env.RESEND_API_KEY);
+const resend = new Resend(process.env.RESEND_API_KEY ?? import.meta.env.RESEND_API_KEY);
 
 export const POST: APIRoute = async ({ request }) => {
   try {
@@ -21,7 +21,7 @@ export const POST: APIRoute = async ({ request }) => {
       email,
       firstName: 'Erlang',
       unsubscribed: false,
-      audienceId: import.meta.env.RESEND_AUDIENCE_ID,
+      audienceId: process.env.RESEND_AUDIENCE_ID ?? import.meta.env.RESEND_AUDIENCE_ID,
     });
 
     return new Response(JSON.stringify({ success: true, data: result }), {

@@ -233,7 +233,7 @@ const sortedLessons = lessons.sort(
           <!-- CTA Buttons -->
           <div class="flex flex-col sm:flex-row gap-4 justify-center mb-16">
             <a
-              href={`/lessons/${sortedLessons[0].slug}`}
+              href={`/lessons/${sortedLessons[0].id}`}
               class="group relative inline-flex items-center justify-center px-8 py-4 bg-gradient-to-r from-blue-600 to-blue-700 text-white font-semibold rounded-xl overflow-hidden transition-all duration-300 hover:scale-105 hover:shadow-2xl hover:shadow-blue-500/25"
             >
               <span class="relative z-10 flex items-center">
@@ -665,7 +665,7 @@ ok`}</code></pre>
             {
               sortedLessons.slice(0, 5).map((lesson) => (
                 <a
-                  href={`/lessons/${lesson.slug}`}
+                  href={`/lessons/${lesson.id}`}
                   class="group block bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6 transition-all duration-300 hover:shadow-lg hover:border-blue-300 dark:hover:border-blue-700 hover:-translate-y-1"
                 >
                   <div class="flex items-start gap-4">
@@ -737,7 +737,7 @@ ok`}</code></pre>
             {
               sortedLessons.slice(5).map((lesson) => (
                 <a
-                  href={`/lessons/${lesson.slug}`}
+                  href={`/lessons/${lesson.id}`}
                   class="group block bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6 transition-all duration-300 hover:shadow-lg hover:border-blue-300 dark:hover:border-blue-700 hover:-translate-y-1"
                 >
                   <div class="flex items-start gap-4">
@@ -784,7 +784,7 @@ ok`}</code></pre>
             computing.
           </p>
           <a
-            href={`/lessons/${sortedLessons[0].slug}`}
+            href={`/lessons/${sortedLessons[0].id}`}
             class="inline-flex items-center justify-center px-8 py-4 bg-gradient-to-r from-blue-600 to-purple-600 text-white font-semibold rounded-xl transition-all duration-300 hover:scale-105 hover:shadow-2xl hover:shadow-blue-500/25"
           >
             Begin Learning Erlang

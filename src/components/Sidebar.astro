@@ -28,12 +28,12 @@ const currentPath = Astro.url.pathname;
       </h2>
       
       {sortedLessons.map((lesson) => {
-        const isActive = currentPath === `/lessons/${lesson.slug}`;
+        const isActive = currentPath === `/lessons/${lesson.id}`;
         const isCompleted = false; // Will be updated with localStorage
         
         return (
           <a
-            href={`/lessons/${lesson.slug}`}
+            href={`/lessons/${lesson.id}`}
             class={`
               group flex items-center px-3 py-2 text-sm font-medium rounded-md transition-colors
               ${isActive 

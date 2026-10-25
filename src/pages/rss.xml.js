@@ -13,7 +13,7 @@ export async function GET(context) {
       title: `Lesson ${lesson.data.postNumber}: ${lesson.data.title}`,
       pubDate: lesson.data.publishDate,
       description: lesson.data.description,
-      link: `/lessons/${lesson.slug}/`,
+      link: `/lessons/${lesson.id}/`,
     })),
     customData: `<language>en-us</language>`,
   });
