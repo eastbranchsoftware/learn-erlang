@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "steps": {
+    "install": {
+      "commands": ["npm ci"]
+    },
+    "build": {
+      "inputs": [{ "step": "install" }],
+      "commands": ["npm run build"]
+    }
+  },
+  "deploy": {
+    "startCommand": "npm run start",
+    "variables": {
+      "NODE_ENV": "production",
+      "HOST": "0.0.0.0"
+    }
+  }
+}
